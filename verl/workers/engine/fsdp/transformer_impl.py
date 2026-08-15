@@ -694,7 +694,15 @@ class FSDPEngine(BaseEngine):
         micro-batch to a single round, at the cost of temporarily retaining
         unsharded gradients until the final backward.
         """
-        if is_last_micro_batch:
+        defer_sync = self.engine_config.use_no_sync_for_gradient_accumulation
+        if not getattr(self, "_gradient_sync_policy_logged", False):
+            logger.warning(
+                "FSDP gradient accumulation sync policy: defer_until_final_micro_batch=%s",
+                defer_sync,
+            )
+            self._gradient_sync_policy_logged = True
+
+        if is_last_micro_batch or not defer_sync:
             yield
             return
 
@@ -1145,6 +1153,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
         temperature = micro_batch["temperature"]
         temperature_item = temperature
         temperature_is_one = _is_scalar_unit_temperature(temperature)
+        if not getattr(self, "_temperature_scaling_mode_logged", False):
+            logger.warning(
+                "FSDP temperature scaling mode: unit_fast_path=%s source_type=%s",
+                temperature_is_one,
+                type(temperature).__name__,
+            )
+            self._temperature_scaling_mode_logged = True
         if use_fused_kernels:
             assert not isinstance(temperature, torch.Tensor), (
                 "use_fused_kernels does not support per sample temperature yet"

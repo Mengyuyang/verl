@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -48,9 +49,12 @@ class _FSDP2Module:
         self.events.append(enabled)
 
 
-def _make_engine(module):
+def _make_engine(module, *, defer_sync=True):
     engine = object.__new__(FSDPEngine)
     engine.module = module
+    engine.engine_config = SimpleNamespace(
+        use_no_sync_for_gradient_accumulation=defer_sync
+    )
     return engine
 
 
@@ -77,6 +81,20 @@ def test_gradient_sync_context_restores_fsdp2_after_error(monkeypatch):
             raise RuntimeError("backward failed")
 
     assert module.events == [False, True]
+
+
+@pytest.mark.parametrize("version,module_cls", [(1, _FSDP1Module), (2, _FSDP2Module)])
+def test_gradient_sync_context_syncs_every_micro_batch_when_disabled(
+    monkeypatch, version, module_cls
+):
+    module = module_cls()
+    engine = _make_engine(module, defer_sync=False)
+    monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: version)
+
+    with engine._gradient_sync_context(is_last_micro_batch=False):
+        module.events.append("backward")
+
+    assert module.events == ["backward"]
 
 
 def test_gradient_sync_context_keeps_sync_for_final_micro_batch(monkeypatch):

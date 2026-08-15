@@ -51,6 +51,7 @@ class TestFSDPEngineConfigCPU:
         assert config.param_offload is False
         assert config.optimizer_offload is False
         assert config.fsdp_size == -1
+        assert config.use_no_sync_for_gradient_accumulation is False
 
     @pytest.mark.parametrize(
         "offload_params",
