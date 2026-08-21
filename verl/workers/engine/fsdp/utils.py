@@ -14,12 +14,34 @@
 import logging
 import os
 
+import torch
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.utils.device import get_device_name, is_npu_available
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def cast_weight_for_rollout(name: str, tensor: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+    """Cast an FSDP master weight to the rollout wire dtype when safe.
+
+    FSDP commonly keeps fp32 master weights while the rollout model uses bf16
+    or fp16. Sending every master weight in fp32 doubles the transfer volume and
+    can make a single dense tensor exceed the bounded weight-transfer bucket.
+
+    MoE router weights are the exception: vLLM keeps them in fp32 for routing
+    stability. Preserve both the Transformers/HF name (``mlp.gate.weight``) and
+    the Megatron-style name (``mlp.router.weight``); cast all other floating
+    weights to the configured FSDP mixed-precision dtype.
+    """
+    if not tensor.is_floating_point() or tensor.dtype == target_dtype:
+        return tensor
+
+    if name.endswith((".mlp.gate.weight", ".mlp.router.weight")):
+        return tensor
+
+    return tensor.to(dtype=target_dtype, non_blocking=True)
 
 
 def apply_npu_fsdp_patches(model_config=None):

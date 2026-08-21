@@ -76,7 +76,7 @@ from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, pad_packed_inputs, postprocess_batch_func, prepare_micro_batches
-from .utils import create_device_mesh, get_sharding_strategy, unfuse_moe_params
+from .utils import cast_weight_for_rollout, create_device_mesh, get_sharding_strategy, unfuse_moe_params
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -1023,7 +1023,11 @@ class FSDPEngine(BaseEngine):
             per_tensor_param = (
                 (
                     name,
-                    param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
+                    cast_weight_for_rollout(
+                        name,
+                        param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
+                        self._autocast_dtype,
+                    ),
                 )
                 for name, param in params.items()
             )

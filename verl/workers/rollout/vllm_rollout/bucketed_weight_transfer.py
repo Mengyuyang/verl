@@ -218,7 +218,15 @@ class BucketedWeightSender:
 
     def _direct_send_large_weight(self, name: str, weight: torch.Tensor):
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
-        logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
+        logger.warning(
+            "Weight %s(shape=%s, dtype=%s, size=%.2f MiB) exceeds the %.2f MiB bucket; "
+            "falling back to direct device IPC",
+            name,
+            tuple(weight.shape),
+            weight.dtype,
+            weight.nbytes / (1 << 20),
+            self.bucket_size / (1 << 20),
+        )
         # TODO: support fallback to shared memory
         handle = reduce_tensor(weight)
         bucket_meta: dict[str, TensorMetadata] = {}

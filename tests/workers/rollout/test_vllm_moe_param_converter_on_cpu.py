@@ -15,7 +15,7 @@
 
 import torch
 
-from verl.workers.engine.fsdp.utils import unfuse_moe_params
+from verl.workers.engine.fsdp.utils import cast_weight_for_rollout, unfuse_moe_params
 
 
 def _collect(weights, model_type):
@@ -67,3 +67,40 @@ def test_gpt_oss_packed_weights_are_not_expanded():
     assert converted[1][1] is down
     assert converted[0][1].shape == (2, 8, 6)
     assert converted[1][1].shape == (2, 3, 8)
+
+
+def test_dense_fp32_weight_is_cast_to_rollout_dtype():
+    weight = torch.randn(4, 8, dtype=torch.float32)
+
+    converted = cast_weight_for_rollout("model.embed_tokens.weight", weight, torch.bfloat16)
+
+    assert converted.dtype == torch.bfloat16
+    assert converted.shape == weight.shape
+    assert converted.element_size() == weight.element_size() // 2
+
+
+def test_moe_router_weight_keeps_fp32_precision():
+    for name in ("model.layers.0.mlp.gate.weight", "model.layers.0.mlp.router.weight"):
+        weight = torch.randn(4, 8, dtype=torch.float32)
+
+        converted = cast_weight_for_rollout(name, weight, torch.bfloat16)
+
+        assert converted is weight
+        assert converted.dtype == torch.float32
+
+
+def test_moe_expert_projection_uses_rollout_dtype():
+    weight = torch.randn(4, 8, dtype=torch.float32)
+
+    converted = cast_weight_for_rollout("model.layers.0.mlp.experts.0.gate_proj.weight", weight, torch.bfloat16)
+
+    assert converted.dtype == torch.bfloat16
+
+
+def test_non_floating_weight_is_not_cast():
+    weight = torch.arange(8, dtype=torch.int64)
+
+    converted = cast_weight_for_rollout("model.position_ids", weight, torch.bfloat16)
+
+    assert converted is weight
+    assert converted.dtype == torch.int64
