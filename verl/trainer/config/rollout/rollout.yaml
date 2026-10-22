@@ -503,7 +503,7 @@ quantization:
 # MTP configuration, reuse model configuration
 mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
 
-# Prefill-Decode disaggregation (SGLang only; keep rollout.name=sglang and toggle enabled=True).
+# Prefill-Decode disaggregation.
 disaggregation:
 
   # Master switch for PD disaggregation.
@@ -515,8 +515,25 @@ disaggregation:
   # Number of decode replicas.
   decode_replicas: 1
 
+  # P-to-D routing policy. Null uses verl's built-in decode router.
+  # Set router_config_path to a selector YAML supplied by uni-agent or another plugin.
+  decode_policy:
+    router_config_path: null
+
   # Decode TP override; null = same as tensor_model_parallel_size.
   decode_tensor_model_parallel_size: null
+
+  # Per-role memory utilization; null inherits rollout.gpu_memory_utilization.
+  prefill_gpu_memory_utilization: null
+  decode_gpu_memory_utilization: null
+
+  # Per-role vLLM kwargs, deep-merged over rollout.engine_kwargs.vllm.
+  prefill_engine_kwargs:
+    max_num_batched_tokens: null
+    max_num_seqs: null
+  decode_engine_kwargs:
+    max_num_batched_tokens: null
+    max_num_seqs: null
 
   # KV cache transport: nixl | mooncake | ascend | mori | fake.
   transfer_backend: nixl

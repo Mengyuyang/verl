@@ -40,6 +40,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _replica_label(replica_rank: int, endpoint_labels: dict[str, Any]):
+    """Return the scrape label with the PD role folded in."""
+    role = str(endpoint_labels.get("pd_role") or "")
+    if role == "prefill":
+        return f"{replica_rank}-prefill"
+    if role == "decode":
+        return f"{replica_rank}-decode{endpoint_labels.get('pd_index', 0)}"
+    return replica_rank
+
+
 class LLMServerClient:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -84,7 +94,7 @@ class LLMServerClient:
         # Fire-and-forget: release is just a counter decrement, no need to await.
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         pool = {"request_id": request_id}
-        fields = {name: pool[name] for name in self._lb_require_release_fields if name in pool}
+        fields = {name: pool[name] for name in (self._lb_require_release_fields or []) if name in pool}
         self._load_balancer.release_server.remote(server_id=server_id, **fields)
 
     def _vllm_request_id(self, request_id: str) -> str:
@@ -500,9 +510,25 @@ class LLMServerManager:
         else:
             await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
 
-        self.server_handles = [server._server_handle for server in self.rollout_replicas]
-        self.server_addresses = [server._server_address for server in self.rollout_replicas]
+        request_endpoints = [
+            (replica, endpoint_index, address, handle)
+            for replica in self.rollout_replicas
+            for endpoint_index, (address, handle) in enumerate(replica.get_request_server_endpoints())
+        ]
+        self.server_addresses = [address for _, _, address, _ in request_endpoints]
+        self.server_handles = [handle for _, _, _, handle in request_endpoints]
         print(f"LLMServerManager: {self.server_addresses}")
+
+        metrics_endpoints = [
+            (replica, address, endpoint_labels)
+            for replica in self.rollout_replicas
+            for address, endpoint_labels in replica.get_metrics_server_endpoints()
+        ]
+        metrics_addresses = [address for _, address, _ in metrics_endpoints]
+        metrics_labels = [
+            {"replica": _replica_label(replica.replica_rank, endpoint_labels), **endpoint_labels}
+            for replica, _, endpoint_labels in metrics_endpoints
+        ]
 
         # Update Prometheus / rl-insight metrics with server addresses
         needs_metrics = self.rollout_config.prometheus.enable or RLInsightLogger.enabled()
@@ -512,13 +538,16 @@ class LLMServerManager:
         if not self.rollout_config.disable_log_stats:
             if self.rollout_config.prometheus.enable:
                 update_prometheus_config(
-                    self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name
+                    self.rollout_config.prometheus,
+                    metrics_addresses,
+                    self.rollout_config.name,
+                    labels=metrics_labels,
                 )
             if RLInsightLogger.enabled():
                 RLInsightLogger.register_rollout_metrics(
-                    self.server_addresses,
+                    metrics_addresses,
                     self.rollout_config.name,
-                    labels=[{"replica": server.replica_rank} for server in self.rollout_replicas],
+                    labels=metrics_labels,
                 )
 
     async def _init_global_load_balancer(self) -> None:
