@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import json
 import logging
 import os
 
@@ -272,76 +271,27 @@ def extract_response_topk_logprobs_with_coverage(
     return sampled, ids, head_log_probs, complete
 
 
-def _merge_rollout_static_configs(
-    config_file: str,
-    server_addresses: list[str],
-    labels: list[dict[str, object] | None] | None,
-) -> list[dict[str, object]]:
-    """Merge rollout endpoints while preserving existing Prometheus targets."""
+def _get_rollout_targets(config_file: str, server_addresses: list[str]) -> list[str]:
+    """Merge new rollout server addresses into the existing Prometheus rollout targets."""
     try:
         with open(config_file) as f:
             existing_config = yaml.safe_load(f) or {}
     except (OSError, yaml.YAMLError):
         existing_config = {}
 
-    target_order: list[str] = []
-    endpoint_labels: dict[str, dict[str, object] | None] = {}
+    existing_targets: list[str] = []
     if isinstance(existing_config, dict):
         for scrape_config in existing_config.get("scrape_configs", []):
             if not isinstance(scrape_config, dict) or scrape_config.get("job_name") != "rollout":
                 continue
             for static_config in scrape_config.get("static_configs", []):
                 if isinstance(static_config, dict):
-                    targets = list(static_config.get("targets", []))
-                    static_labels = static_config.get("labels") or {}
-                    for target in targets:
-                        if target not in endpoint_labels:
-                            target_order.append(target)
-                        endpoint_labels[target] = static_labels
+                    existing_targets.extend(static_config.get("targets", []))
 
-    if labels is None:
-        for address in server_addresses:
-            if address not in endpoint_labels:
-                target_order.append(address)
-                endpoint_labels[address] = {}
-    else:
-        if len(labels) != len(server_addresses):
-            raise ValueError(
-                f"The number of metric labels ({len(labels)}) must match "
-                f"the number of server addresses ({len(server_addresses)})"
-            )
-        for address, endpoint_label in zip(server_addresses, labels, strict=True):
-            if address not in endpoint_labels:
-                target_order.append(address)
-            endpoint_labels[address] = endpoint_label or {}
-
-    grouped: dict[str, dict[str, object]] = {}
-    for address in target_order:
-        endpoint_label = endpoint_labels[address]
-        group_key = json.dumps(endpoint_label, sort_keys=True)
-        static_config = grouped.setdefault(
-            group_key,
-            {"targets": [], **({"labels": endpoint_label} if endpoint_label else {})},
-        )
-        static_config["targets"].append(address)
-    return list(grouped.values()) or [{"targets": []}]
+    return list(dict.fromkeys([*existing_targets, *server_addresses]))
 
 
-def _get_rollout_targets(config_file: str, server_addresses: list[str]) -> list[str]:
-    """Return the merged targets for callers that do not consume metric labels."""
-    return [
-        target
-        for group in _merge_rollout_static_configs(config_file, server_addresses, None)
-        for target in group["targets"]
-    ]
-
-
-def update_prometheus_config(
-    config: PrometheusConfig,
-    server_addresses: list[str],
-    rollout_name: str | None = None,
-    labels: list[dict[str, object] | None] | None = None,
-):
+def update_prometheus_config(config: PrometheusConfig, server_addresses: list[str], rollout_name: str | None = None):
     """
     Update Prometheus configuration file with server addresses and reload on first node.
     Existing rollout targets in the configuration file are preserved.
@@ -349,8 +299,6 @@ def update_prometheus_config(
     server_addresses: vllm or sglang server addresses
 
     rollout_name: name of the rollout backend (e.g., "vllm", "sglang")
-
-    labels: optional Prometheus labels for each server address
     """
 
     if not server_addresses:
@@ -359,11 +307,7 @@ def update_prometheus_config(
 
     try:
         # Get Prometheus config file path from environment or use default
-        rollout_static_configs = _merge_rollout_static_configs(
-            config.file,
-            server_addresses,
-            labels,
-        )
+        rollout_targets = _get_rollout_targets(config.file, server_addresses)
         prometheus_config_json = {
             "global": {"scrape_interval": "10s", "evaluation_interval": "10s"},
             "scrape_configs": [
@@ -371,7 +315,7 @@ def update_prometheus_config(
                     "job_name": "ray",
                     "file_sd_configs": [{"files": ["/tmp/ray/prom_metrics_service_discovery.json"]}],
                 },
-                {"job_name": "rollout", "static_configs": rollout_static_configs},
+                {"job_name": "rollout", "static_configs": [{"targets": rollout_targets}]},
             ],
         }
 

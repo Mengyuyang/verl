@@ -258,22 +258,6 @@ class RolloutReplica(ABC):
         """Get rollout server handle for Token-in-token-out generation."""
         return self._server_handle
 
-    def get_request_server_endpoints(self) -> list[tuple[str, ActorHandle]]:
-        """Return all endpoints that accept generation requests."""
-        if self._server_address is None or self._server_handle is None:
-            raise RuntimeError("rollout server has not been launched")
-        return [(self._server_address, self._server_handle)]
-
-    def get_metrics_server_endpoints(self) -> list[tuple[str, dict[str, Any]]]:
-        """Return metrics endpoints and their additional labels."""
-        return [
-            (
-                address,
-                {"request_endpoint": index, "pd_role": "unified", "pd_index": index},
-            )
-            for index, (address, _) in enumerate(self.get_request_server_endpoints())
-        ]
-
     def rollout_worker_use_gpu(self) -> bool:
         return True
 

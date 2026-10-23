@@ -63,33 +63,6 @@ def test_disaggregation_disabled_skips_validation():
     assert cfg.enabled is False
 
 
-@pytest.mark.parametrize("role", ["prefill", "decode"])
-@pytest.mark.parametrize("value", [0, -0.1, 1.1])
-def test_disaggregation_bad_role_memory_rejected(role, value):
-    with pytest.raises(ValueError, match="gpu_memory_utilization"):
-        DisaggregationConfig(enabled=True, **{f"{role}_gpu_memory_utilization": value})
-
-
-@pytest.mark.parametrize("role", ["prefill", "decode"])
-@pytest.mark.parametrize("field", ["max_num_batched_tokens", "max_num_seqs"])
-@pytest.mark.parametrize("value", [0, -1, 1.5, True])
-def test_disaggregation_bad_role_scheduler_limit_rejected(role, field, value):
-    with pytest.raises(ValueError, match=field):
-        DisaggregationConfig(enabled=True, **{f"{role}_engine_kwargs": {field: value}})
-
-
-def test_disaggregation_role_override_whitelist_and_limits():
-    with pytest.raises(ValueError, match="unsupported prefill_engine_kwargs"):
-        DisaggregationConfig(enabled=True, prefill_engine_kwargs={"tensor_parallel_size": 4})
-    with pytest.raises(ValueError, match="must be >= max_num_seqs"):
-        DisaggregationConfig(enabled=True, decode_engine_kwargs={"max_num_batched_tokens": 64, "max_num_seqs": 128})
-
-
-def test_disaggregation_decode_policy_coercion():
-    cfg = DisaggregationConfig(enabled=True, decode_policy={"router_config_path": "router.yaml"})
-    assert cfg.decode_policy.router_config_path == "router.yaml"
-
-
 def test_rollout_config_sglang_with_disagg_enabled_ok():
     cfg = RolloutConfig(
         name="sglang",

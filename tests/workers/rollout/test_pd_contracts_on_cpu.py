@@ -26,7 +26,7 @@ import socket
 import types
 import uuid
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -58,7 +58,7 @@ def _remote(function):
 
 @pytest.mark.parametrize("fields", [[], ["prompt_ids"]])
 def test_decode_router_only_receives_declared_fields(fields):
-    functions = _load_functions(SERVER, ["_select_decode_peer"], "vLLMHttpServer")
+    functions = _load_functions(SERVER, ["_select_decode_peer_for_dispatch"], "vLLMHttpServer")
     calls = []
     peer = object()
 
@@ -70,26 +70,26 @@ def test_decode_router_only_receives_declared_fields(fields):
     stub = types.SimpleNamespace(
         _pd_router=types.SimpleNamespace(acquire_server=_remote(acquire)),
         _pd_router_acquire_fields=fields,
-        _pd_decode_candidates=[types.SimpleNamespace(key="d", handle=peer)],
+        _pd_decode_peer_ids=["d"],
         _pd_decode_peers=[peer],
-        _pd_peer_idx=0,
+        _select_decode_peer=Mock(side_effect=AssertionError("unexpected fallback")),
     )
-    result = asyncio.run(functions._select_decode_peer(stub, "session", [1, 2]))
-    assert result == (0, peer, "d")
+    result = asyncio.run(functions._select_decode_peer_for_dispatch(stub, "session", [1, 2]))
+    assert result == (peer, "d")
     assert calls == [("session", {"prompt_ids": [1, 2]} if fields else {})]
-    assert stub._pd_peer_idx == 0  # No fallback due to an unexpected keyword argument.
+    stub._select_decode_peer.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", ["success", "prefill_error", "decode_error", "cancelled"])
 @pytest.mark.parametrize("release_fields", [[], ["request_id"]])
 def test_dispatch_releases_reservation_on_every_exit(outcome, release_fields):
     helper = _load_functions(SERVER, ["_build_mooncake_decode_kv_params"])
-    dispatch = _load_functions(
+    methods = _load_functions(
         SERVER,
-        ["_pd_dispatch"],
+        ["_pd_dispatch", "_build_pd_decode_kv_params", "_release_pd_decode_peer"],
         "vLLMHttpServer",
         _build_mooncake_decode_kv_params=helper._build_mooncake_decode_kv_params,
-    )._pd_dispatch
+    )
     release = AsyncMock()
     decode = AsyncMock(return_value="generated")
     if outcome == "decode_error":
@@ -101,9 +101,9 @@ def test_dispatch_releases_reservation_on_every_exit(outcome, release_fields):
         generate.side_effect = RuntimeError("prefill failed")
     elif outcome == "cancelled":
         generate.side_effect = asyncio.CancelledError()
-    select = AsyncMock(return_value=(0, peer, "d"))
+    select = AsyncMock(return_value=(peer, "d"))
     stub = types.SimpleNamespace(
-        _select_decode_peer=select,
+        _select_decode_peer_for_dispatch=select,
         _pd_router=types.SimpleNamespace(release_server=types.SimpleNamespace(remote=release)),
         _pd_router_release_fields=release_fields,
         _disaggregation_kv_transfer_config={"kv_connector": "MooncakeConnectorV1"},
@@ -111,9 +111,11 @@ def test_dispatch_releases_reservation_on_every_exit(outcome, release_fields):
         _pd_prefill_side_channel_port=12345,
         generate=generate,
     )
+    stub._build_pd_decode_kv_params = types.MethodType(methods._build_pd_decode_kv_params, stub)
+    stub._release_pd_decode_peer = types.MethodType(methods._release_pd_decode_peer, stub)
 
     async def run():
-        return await dispatch(stub, [1, 2], {"max_tokens": 20}, "turn", session_id="session")
+        return await methods._pd_dispatch(stub, [1, 2], {"max_tokens": 20}, "turn", session_id="session")
 
     if outcome == "success":
         assert asyncio.run(run()) == "generated"
@@ -212,7 +214,8 @@ def test_port_ranges_are_contiguous_and_disjoint():
 
 
 def test_sleep_drains_then_disconnects_all_peers_before_sleep():
-    sleep = _load_functions(REPLICA, ["sleep"], "vLLMPDReplica").sleep
+    sleep = _load_functions(SERVER, ["sleep"], "vLLMReplica").sleep
+    hook = _load_functions(REPLICA, ["_before_server_sleep"], "vLLMPDReplica")._before_server_sleep
     events = []
 
     def server(name):
@@ -224,10 +227,10 @@ def test_sleep_drains_then_disconnects_all_peers_before_sleep():
 
     prefill, decode = server("p"), server("d")
     stub = types.SimpleNamespace(
-        get_request_server_endpoints=lambda: [("p", prefill)],
         servers=[prefill, decode],
         _is_ascend_platform=lambda: True,
     )
+    stub._before_server_sleep = types.MethodType(hook, stub)
     asyncio.run(sleep(stub))
     assert events == [
         ("drain", "p"),
@@ -235,4 +238,72 @@ def test_sleep_drains_then_disconnects_all_peers_before_sleep():
         ("disconnect_kv_transfer_peers", "d"),
         ("sleep", "p"),
         ("sleep", "d"),
+    ]
+
+
+def test_no_router_keeps_round_robin():
+    select = _load_functions(SERVER, ["_select_decode_peer_for_dispatch"], "vLLMHttpServer")
+    peer = object()
+    stub = types.SimpleNamespace(_pd_router=None, _select_decode_peer=Mock(return_value=peer))
+    assert asyncio.run(select._select_decode_peer_for_dispatch(stub, "session", [1])) == (peer, None)
+    stub._select_decode_peer.assert_called_once()
+
+
+@pytest.mark.parametrize("connector,remote", [("MooncakeConnector", True), ("MooncakeConnectorV1", False)])
+def test_empty_prefill_respects_connector_specific_semantics(connector, remote):
+    helper = _load_functions(SERVER, ["_build_mooncake_decode_kv_params"])
+    build = _load_functions(
+        SERVER,
+        ["_build_pd_decode_kv_params"],
+        "vLLMHttpServer",
+        _build_mooncake_decode_kv_params=helper._build_mooncake_decode_kv_params,
+    )._build_pd_decode_kv_params
+    stub = types.SimpleNamespace(_pd_prefill_engine_id="p", _pd_prefill_side_channel_port=12345)
+    params = build(stub, types.SimpleNamespace(extra_fields={}), connector, "transfer", "request")
+    assert params["do_remote_prefill"] is remote
+    assert params["do_remote_decode"] is False
+
+
+def test_unified_resume_only_resumes_coordinator_then_opens_all_gates():
+    resume = _load_functions(SERVER, ["resume_generation"], "vLLMReplica").resume_generation
+    events = []
+    servers = [
+        types.SimpleNamespace(
+            resume_engine_generation=_remote(lambda i=i: events.append(("resume", i))),
+            open_submission_gate=_remote(lambda i=i: events.append(("open", i))),
+        )
+        for i in range(2)
+    ]
+    asyncio.run(resume(types.SimpleNamespace(servers=servers)))
+    assert events == [("resume", 0), ("open", 0), ("open", 1)]
+
+
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_partial_port_reservation_failure_closes_acquired_sockets(contiguous):
+    sock = Mock()
+    allocate = Mock(side_effect=[(39000, [sock] if contiguous else sock), OSError("port unavailable")])
+    reserve = _load_functions(
+        REPLICA,
+        ["_reserve_pd_ports"],
+        "vLLMPDReplica",
+        get_free_port=allocate,
+    )._reserve_pd_ports
+    stub = types.SimpleNamespace(_prefill_tp=2, _decode_tp=2, world_size=4, _n_decode=1, _reserve_port_range=allocate)
+    with pytest.raises(OSError, match="port unavailable"):
+        reserve(stub, "127.0.0.1", contiguous)
+    sock.close.assert_called_once()
+
+
+def test_metrics_endpoints_cover_both_roles():
+    metrics = _load_functions(REPLICA, ["get_metrics_server_endpoints"], "vLLMPDReplica").get_metrics_server_endpoints
+    stub = types.SimpleNamespace(
+        _prefill_servers=[object()],
+        _decode_servers=[object(), object()],
+        _prefill_server_addresses=["p:1"],
+        _decode_server_addresses=["d0:1", "d1:1"],
+    )
+    assert metrics(stub) == [
+        ("p:1", {"pd_role": "prefill", "pd_index": 0}),
+        ("d0:1", {"pd_role": "decode", "pd_index": 0}),
+        ("d1:1", {"pd_role": "decode", "pd_index": 1}),
     ]

@@ -1,47 +1,26 @@
-# Ascend PD integration: fork review notes
+# Ascend PD integration: final-local fork review
 
-Last updated: 10/22/2026.
+Last updated: 10/23/2026.
 
-## Scope
+## Scope and source
 
-This branch ports a colleague-provided PD snapshot onto current upstream `main`
-(`831c5d86e58972ef2e26f00345fde1be700611cf`). The corrected source is
-`uni-agent1013-dr.rar` (SHA256
-`60E978770C670EF2658D6C8FF08DF5B002647EAC0F0FDFBEB717EA3B435CCE00`),
-with verl baseline `2035f58dcb06d8cad4caee107b30f4045d724367`.
-It is intended for review in
-`Mengyuyang/verl`, with that fork's synchronized `main` as the merge target.
-The baseline already supports single-node 1P+ND and asymmetric TP. This change
-adds Ascend connector configuration, optional decode routing plugins, role
-overrides, metrics labels, and sleep-path connection cleanup.
+This revision follows `uni-agent1013-dr-final-local.rar`, SHA256
+`8AF98361FE5C19978106076F1B637687DC179F3A72ED656AD617FDA54124F9D5`.
+Its verl baseline is `263653e749306287a5032140cce3d7833c1959d0`;
+this PR targets the fork main synchronized to upstream
+`d430157d15516d89e0cc853fd10fcd21d9234c44`.
 
-Related upstream work: [verl-project/verl#7616](https://github.com/verl-project/verl/pull/7616).
-This is not another submission to upstream. That PR also implements Ascend PD,
-but exposes built-in `decode_policy.type` strategies; this snapshot uses
-`decode_policy.router_config_path` to adapt external selectors to the existing
-`RequestLoadBalancer` protocol. Coordinate with that work before any upstream PR.
+Compared with the previous PR revision, the final source reduces the integration
+surface. The runtime changes are limited to `llm_server.py`,
+`vllm_async_server.py`, and `vllm_pd_replica.py`. The strategy adapter moves
+to Uni-Agent. PD-specific dataclass/YAML extensions, generic replica endpoint
+APIs and the Prometheus label merger are restored to upstream.
 
-## Read the changes in this order
+Basic single-node 1P+ND and asymmetric TP already existed in upstream.
+This change adds Ascend connector/ports, optional standard-router integration,
+Ascend metrics discovery and KV lifecycle hooks; it does not invent PD itself.
 
-1. `verl/workers/config/disaggregation.py` and the rollout/reward YAML files:
-   choose P/D sizes, role memory and scheduler limits, and an optional router.
-2. `verl/workers/rollout/vllm_rollout/vllm_pd_replica.py`: construct P/D servers,
-   reserve non-overlapping port ranges, build the Ascend `MooncakeConnectorV1`
-   config, expose P-only request endpoints and P+D metric endpoints.
-3. `verl/workers/rollout/pd_decode_selector.py`: load YAML and adapt legacy
-   `select(req, candidates)` strategies or use a native router-protocol plugin.
-   With no plugin configured, use verl's built-in sticky/least-inflight router.
-4. `verl/workers/rollout/vllm_rollout/vllm_async_server.py`: reserve a D server,
-   run P, preserve its KV transfer metadata, run D, release the reservation in
-   `finally`; reset routing state when caches are invalidated.
-5. `verl/workers/rollout/replica.py`, `llm_server.py`, and `utils.py`: keep request
-   routing separate from metrics discovery; preserve existing Prometheus targets
-   while adding role labels.
-
-## Minimal configuration
-
-An illustrative single-node layout uses 4 devices: 1P with TP=2 plus 1D with TP=2.
-Set the remaining trainer/model/resource-pool settings for your deployment.
+## Configuration migration
 
 ```yaml
 actor_rollout_ref:
@@ -56,88 +35,104 @@ actor_rollout_ref:
       decode_replicas: 1
       decode_tensor_model_parallel_size: 2
       transfer_backend: mooncake
-      decode_policy:
-        router_config_path: null
-      prefill_gpu_memory_utilization: 0.7
-      decode_gpu_memory_utilization: 0.8
-      prefill_engine_kwargs:
-        max_num_batched_tokens: 8192
-        max_num_seqs: 16
-      decode_engine_kwargs:
-        max_num_batched_tokens: 2048
-        max_num_seqs: 32
+    custom:
+      pd_router_config_path: /absolute/path/to/session_sticky.yaml
 ```
 
-The default router does not require Uni-Agent. Optional legacy strategies need
-the matching Uni-Agent changes, for example
-`pkg://uni_agent.rollout.configs/session_sticky.yaml`. Those files are not part
-of this verl PR. A native protocol plugin must implement the full lifecycle
-contract in `verl/workers/rollout/router.py`, not only acquire/release.
+This illustrative topology occupies four devices, not two. Complete the
+model/training/resource settings for the actual environment.
 
-The P+D device footprint must fit one node. DP and PP remain 1. Role-specific
-engine overrides are limited to `max_num_batched_tokens` and `max_num_seqs`.
+- Use `rollout.custom.pd_router_config_path`, not the removed
+  `disaggregation.decode_policy.router_config_path`.
+- The existing upstream router factory loads a filesystem YAML path, not the
+  former PD adapter's `pkg://...` URL. Make it accessible to Ray workers.
+- The YAML sets `router_class: uni_agent.rollout.router_balancer.SelectorRouter`
+  and a `selector_class` plus selector parameters.
+- No configured path means **round-robin**. Optional custom PD routing only
+  activates on Ascend. GPU PD retains upstream selection behavior.
+- Role-local memory/batching extensions from the previous revision are no
+  longer supported; P/D share normal rollout settings apart from their TP.
+- The private archived baseline launcher and launcher tests still refer to old
+  schema/missing deps; they are not shipped or claimed to run.
 
-## Porting changes beyond the original snapshot
+## Code walkthrough
 
-- Preserve upstream top-k log-probability validation and do not restore removed
-  QAT configuration.
-- Preserve `_get_rollout_targets` for existing unlabeled-metrics callers/tests.
-- Respect `require_acquire_fields` / `require_release_fields` when invoking a
-  router. Passing `prompt_ids` unconditionally breaks the default router's
-  signature and silently causes round-robin fallback.
-- Add CPU-only contract tests for declared fields, KV metadata, release on
-  success/error/cancellation, asymmetric TP, port ranges and sleep ordering.
-- Port the corrected snapshot's local-compute fallback when P has no transferable
-  KV blocks. Also handle nonempty outer containers of empty groups without
-  mistaking block ID zero for an empty block list.
-- Resume every independent P/D engine, then open all submission gates. Keep this
-  in `vLLMPDReplica`; do not replace the unified DP replica's collective resume.
-- Exclude the snapshot's global Megatron scalar-gradient monkey patch: it is a
-  separate training-memory workaround, has no NPU guard, and needs its own review.
+1. `vllm_pd_replica.py` chooses MooncakeConnectorV1 on Ascend, supplies both
+   TP sizes and per-engine KV ports, and reserves consecutive ranges. GPU keeps
+   its original port-allocation/connector path.
+2. `vllm_async_server.py::set_pd_peer` builds the configured router through
+   `get_router_handle`; policy implementation stays in Uni-Agent.
+3. `_pd_dispatch` reserves D, runs P, builds connector-specific metadata,
+   runs D, and releases in finally. GPU Mooncake retains upstream handshake
+   semantics; Ascend V1 preserves P block metadata and computes locally when
+   no transferable blocks are available. NIXL rejects missing metadata.
+4. Cache-invalidating server operations clear router affinity. Shared replica
+   sleep invokes an optional `_before_server_sleep` hook after its drain;
+   the PD override disconnects all Ascend KV peers before sleep.
+5. `llm_server.py` exposes P+D metrics addresses only for Ascend PD. RLInsight
+   receives role labels. Prometheus receives the addresses but this revision
+   does **not** add the former custom static role-label merger.
 
-## Validation and limitations
+## Porting safeguards beyond the supplied source
 
-Run the focused tests from the repository root in a suitable environment:
+- Preserve current main's quantization implementation instead of restoring
+  the archive baseline's removed QAT path.
+- Honor `require_acquire_fields` and `require_release_fields`; custom native
+  routers need not accept prompt_ids or request_id at release.
+- Detect nested empty block groups while retaining valid block ID zero.
+- Keep PD resume in the subclass: all independent engines resume successfully
+  before any submission gate opens. Unified DP retains upstream sequencing.
+- Close already acquired sockets if a later port-range reservation fails.
+- Extend CPU contracts and retain the source's minimal integration tests.
+
+## Validation and remaining merge gates
 
 ```bash
-python -m pytest -q tests/workers/rollout/test_pd_contracts_on_cpu.py
-python -m pytest -q tests/workers/rollout/test_pd_disaggregation.py tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py tests/workers/rollout/test_pd_decode_router_adapter_on_cpu.py tests/workers/rollout/test_pd_metrics_labels_on_cpu.py tests/workers/rollout/test_prometheus_rollout_targets_on_cpu.py tests/workers/rollout/test_router_on_cpu.py tests/workers/rollout/test_topk_coverage_on_cpu.py
-pre-commit run --all-files --show-diff-on-failure
+python -m pytest -q tests/workers/rollout/test_pd_contracts_on_cpu.py --noconftest
+# 32 passed
+python -m pytest -q tests/workers/rollout/test_pd_minimal_custom_on_cpu.py tests/workers/rollout/test_pd_disaggregation.py tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py --noconftest --maxfail=1
 ```
 
-The new `*_on_cpu.py` files match the existing CPU workflow collection pattern;
-that workflow is owner-gated and is not automatically available on this fork.
-AST-based tests execute selected production methods without loading vLLM. They
-do not validate Ray actor startup or actual KV transport. vLLM-dependent tests
-skip when vLLM is unavailable; optional Uni-Agent tests skip without that package.
+The second command failed during Windows PyTorch collection with WinError 1114
+loading c10.dll. It is not counted as passing. AST contracts execute production
+methods with fake remote calls; they do not prove engine startup or transport.
+Hardware and complete application validation remain pending.
 
-Local results on Windows/Python 3.12: **25 contract tests passed**, changed-file
-Ruff lint/format passed, and Python compilation passed. The four generated
-trainer YAMLs were regenerated and verified with Python 3.12. Mypy and the
-license/docs checks passed. Broader pytest collection failed while loading the
-Windows PyTorch DLL; it was not counted as a pass. The full pre-commit invocation
-was not green: its default Python 3.9/python3 resolution and a pre-existing
-Windows path-separator issue in the test-layout check required explicit Python
-3.12/manual checks. Hardware, complete application tests and CI remain pending.
+Changed-file Ruff, formatting, mypy, generated-config verification and the
+other pre-commit checks passed, except two local Windows hook failures: the
+test-structure allowlist uses POSIX paths, and the compileall hook selected an
+older Python that cannot parse upstream match statements. Explicit Python 3.12
+compileall passed, as did the structure check with the same three upstream
+allowlisted files expressed using Windows separators. No upstream hook or
+allowlist was changed to mask these failures.
 
-Before merge/deployment, review these remaining integration requirements:
+Before merge:
 
-- Use a matched vLLM-Ascend/Mooncake build providing `MooncakeConnectorV1` and the
-  worker RPC `disconnect_kv_transfer_peers`. Those dependency patches are not
-  bundled here. Merely installing an arbitrary released wheel is not sufficient.
-- Validate real NPU training, concurrent/partial rollout, abort/resume, weight
-  synchronization, sleep/wake and the separate `release_kv_cache` path. Only the
-  replica `sleep` path gains the drain/disconnect ordering in this patch.
-- The colleague's optional legacy selector uses FIFO token-load release;
-  out-of-order completion can miscount pending tokens. The adapter still follows
-  its index-based release contract. Do not treat this as a request-exact tracker;
-  the default built-in router avoids that optional token-accounting implementation.
-- The corrected archive DOES contain a bottom-layer empty KV-group and
-  notification-only completion fix in its patched vLLM-Ascend connector. That
-  dependency is outside this repository and is NOT included in this PR. Verify
-  the actually imported connector, not just the Python package version.
-- Port reservations are released before child servers bind. This avoids internal
-  range overlap but cannot eliminate races with unrelated processes on the host.
+- Resolve optional session-sticky FIFO token-release accounting. Its new
+  adapter still ignores request identity at release; moving it does not fix it.
+- Verify whole P-to-D drain, abort/resume, partial rollout, weight synchronization,
+  sleep/wake and the separate `release_kv_cache` path. The shared sleep drain
+  still observes the first engine; it does not prove all D work completed.
+- Verify matched dependencies providing MooncakeConnectorV1 and
+  `disconnect_kv_transfer_peers`. Final-local contains no `deps` tree.
+  The previous archive's empty-group/completion fixes cannot be assumed to be
+  present in the installed runtime.
+- Releasing reserved ports before child bind still leaves cross-job races.
+- Real NPU performance and non-PD/GPU regressions require target-environment tests.
 
-AI assistance was used for extraction, porting, regression tests and PR preparation.
-Human line-by-line review and hardware validation remain required.
+The source now adds an NPU guard to its Megatron scalar-gradient workaround.
+It is still excluded from this PD-focused PR as a separate training-memory
+change requiring numeric/memory testing.
+
+Related [upstream PR #7616](https://github.com/verl-project/verl/pull/7616)
+was checked on 2026-10-23: closed, not merged. It is reference work, not a
+prerequisite or proof of upstream support. This remains an owner-requested
+fork-only draft; no duplicate upstream PR is being submitted.
+An open-PR search also found [#7859](https://github.com/verl-project/verl/pull/7859),
+which namespaces vLLM's internal TCPStore port search. This change reserves
+Mooncake per-rank KV/handshake ranges instead; it neither includes nor replaces
+that independent internal-port fix.
+
+See [companion Uni-Agent PR](https://github.com/Mengyuyang/uni-agent/pull/1).
+AI assistance was used; human line-by-line review and hardware validation remain
+required.
