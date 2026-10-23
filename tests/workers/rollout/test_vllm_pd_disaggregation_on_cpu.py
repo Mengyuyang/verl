@@ -26,6 +26,7 @@ vLLM-engine tests behind ``@pytest.mark.skipif(not CUDA_AVAILABLE)``.
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from unittest.mock import patch
 
@@ -203,7 +204,9 @@ def test_build_kv_transfer_config_prefill_role_maps_to_kv_producer():
     assert cfg["kv_connector"] == "NixlConnector"
     assert cfg["kv_role"] == "kv_producer"
     assert cfg["engine_id"] == "e0"
-    assert cfg["kv_buffer_device"] == "cuda"
+    from verl.utils.device import get_device_name
+
+    assert cfg["kv_buffer_device"] == get_device_name()
     assert "kv_connector_extra_config" not in cfg
 
 
@@ -421,9 +424,11 @@ def test_pd_replica_init_requires_disaggregation_enabled(patched_replica_cls):
 class _DispatchStub:
     """Minimal vLLMHttpServer-like instance for unbound-method tests."""
 
-    def __init__(self, decode_peers, role="prefill", connector="NixlConnector"):
+    def __init__(self, decode_peers, role="prefill", connector="NixlConnector", router=None):
         self._disaggregation_role = role
         self._pd_decode_peers = list(decode_peers)
+        self._pd_decode_peer_ids = list(decode_peers)
+        self._pd_router = router
         self._pd_peer_idx = 0
         # Used by _pd_dispatch to branch between NIXL (read kv_transfer_params
         # back from prefill) and Mooncake (construct it locally from prefill
@@ -434,12 +439,30 @@ class _DispatchStub:
         self._pd_prefill_side_channel_port = 5559
 
     def _select_decode_peer(self):
-        # Borrow the real implementation to keep the stub aligned with
-        # production rotation semantics — _pd_dispatch's behavior must not
-        # depend on the test's peer-selection policy.
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
         return vLLMHttpServer._select_decode_peer(self)
+
+    async def _select_decode_peer_for_dispatch(self, routing_key, prompt_ids):
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+        return await vLLMHttpServer._select_decode_peer_for_dispatch(self, routing_key, prompt_ids)
+
+    def _build_pd_decode_kv_params(self, prefill_out, connector, transfer_id, request_id):
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+        return vLLMHttpServer._build_pd_decode_kv_params(
+            self,
+            prefill_out,
+            connector,
+            transfer_id,
+            request_id,
+        )
+
+    async def _release_pd_decode_peer(self, server_id, request_id):
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+        return await vLLMHttpServer._release_pd_decode_peer(self, server_id, request_id)
 
 
 def _import_http_server():
@@ -449,10 +472,15 @@ def _import_http_server():
     return vLLMHttpServer
 
 
+def _select_peer(server_cls, stub, routing_key="test"):
+    peer, _ = asyncio.run(server_cls._select_decode_peer_for_dispatch(stub, routing_key, []))
+    return peer
+
+
 def test_select_decode_peer_round_robin_cycles():
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["peer0", "peer1", "peer2"])
-    picks = [server_cls._select_decode_peer(stub) for _ in range(7)]
+    picks = [_select_peer(server_cls, stub) for _ in range(7)]
     assert picks == ["peer0", "peer1", "peer2", "peer0", "peer1", "peer2", "peer0"]
     # Internal counter advances exactly once per call.
     assert stub._pd_peer_idx == 7
@@ -461,7 +489,7 @@ def test_select_decode_peer_round_robin_cycles():
 def test_select_decode_peer_single_peer_returns_same():
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["only_peer"])
-    assert all(server_cls._select_decode_peer(stub) == "only_peer" for _ in range(5))
+    assert all(_select_peer(server_cls, stub) == "only_peer" for _ in range(5))
 
 
 def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
@@ -471,15 +499,33 @@ def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
     future change that randomizes for cache-locality but loses balance)."""
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["peer0", "peer1", "peer2"])
-    counts = Counter(server_cls._select_decode_peer(stub) for _ in range(32))
+    counts = Counter(_select_peer(server_cls, stub) for _ in range(32))
     assert sorted(counts.values()) == [10, 11, 11], (
         f"expected (10, 11, 11) hit counts under strict round-robin, got {dict(counts)}"
     )
     assert max(counts.values()) - min(counts.values()) <= 1
 
 
-@pytest.mark.asyncio
-async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
+def test_router_selection_acquires_and_releases_peer():
+    from unittest.mock import AsyncMock, MagicMock
+
+    server_cls = _import_http_server()
+    router = MagicMock()
+    router.acquire_server.remote = AsyncMock(return_value=("peer1", "handle1"))
+    router.release_server.remote = AsyncMock()
+    stub = _DispatchStub(decode_peers=["peer0", "peer1"], router=router)
+
+    peer, server_id = asyncio.run(server_cls._select_decode_peer_for_dispatch(stub, "session-1", [1, 2, 3]))
+    assert peer == "handle1"
+    assert server_id == "peer1"
+    asyncio.run(server_cls._release_pd_decode_peer(stub, server_id, "session-1"))
+    router.release_server.remote.assert_awaited_once_with(
+        server_id="peer1",
+        request_id="session-1",
+    )
+
+
+def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     """End-to-end shape of ``_pd_dispatch``: prefill leg sets max_tokens=1 +
     do_remote_decode, decode leg gets the prefill's kv_transfer_params."""
     from unittest.mock import MagicMock
@@ -518,11 +564,13 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     stub = _DispatchStub(decode_peers=[decode_peer])
     stub.generate = fake_generate
 
-    result = await server_cls._pd_dispatch(
-        stub,
-        prompt_ids=[1, 2, 3],
-        sampling_params={"max_tokens": 64, "temperature": 0.0},
-        request_id="req-foo",
+    result = asyncio.run(
+        server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1, 2, 3],
+            sampling_params={"max_tokens": 64, "temperature": 0.0},
+            request_id="req-foo",
+        )
     )
 
     # Prefill leg was called once with max_tokens=1 + do_remote_decode params.
@@ -549,8 +597,7 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     assert result.token_ids == expected_decode_token_ids
 
 
-@pytest.mark.asyncio
-async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
+def test_pd_dispatch_mooncake_v1_constructs_decode_kv_params_locally():
     """Under Mooncake, prefill's request_finished returns (_, None) — no
     kv_transfer_params come back. _pd_dispatch must instead construct decode
     kv_transfer_params from the prefill state set by set_pd_peer (engine_id +
@@ -570,14 +617,16 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
         # Mooncake's prefill response carries no kv_transfer_params.
         return TokenOutput(token_ids=[42], stop_reason="completed", extra_fields={})
 
-    stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeConnector")
+    stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeConnectorV1")
     stub.generate = fake_generate
 
-    await server_cls._pd_dispatch(
-        stub,
-        prompt_ids=[1, 2],
-        sampling_params={"max_tokens": 16, "temperature": 0.0},
-        request_id="req-mc",
+    asyncio.run(
+        server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1, 2],
+            sampling_params={"max_tokens": 16, "temperature": 0.0},
+            request_id="req-mc",
+        )
     )
 
     assert len(captured_prefill) == 1
@@ -588,7 +637,9 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     decode_peer.generate.remote.assert_called_once()
     dkw = decode_peer.generate.remote.call_args
     dkv = dkw.kwargs["kv_transfer_params"]
-    assert dkv["do_remote_prefill"] is True
+    # Empty prefill responses have no remote blocks; decode must compute the
+    # prompt locally instead of advertising an invalid remote prefill.
+    assert dkv["do_remote_prefill"] is False
     assert dkv["do_remote_decode"] is False
     assert dkv["remote_engine_id"] == stub._pd_prefill_engine_id
     assert dkv["remote_bootstrap_addr"] == f"http://127.0.0.1:{stub._pd_prefill_side_channel_port}"
@@ -596,8 +647,36 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     assert dkv["transfer_id"] == transfer_id
 
 
-@pytest.mark.asyncio
-async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
+def test_gpu_pd_dispatch_keeps_upstream_mooncake_params():
+    """GPU Mooncake behavior must remain the upstream 'always remote prefill' path."""
+    from unittest.mock import MagicMock
+
+    server_cls = _import_http_server()
+    decode_peer = MagicMock()
+    decode_peer.generate.remote = MagicMock(return_value=_make_awaitable_token_output([7]))
+
+    async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
+        from verl.workers.rollout.replica import TokenOutput
+
+        return TokenOutput(token_ids=[42], stop_reason="completed", extra_fields={})
+
+    stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeConnector")
+    stub.generate = fake_generate
+    asyncio.run(
+        server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1, 2],
+            sampling_params={"max_tokens": 16},
+            request_id="req-gpu-mc",
+        )
+    )
+
+    dkv = decode_peer.generate.remote.call_args.kwargs["kv_transfer_params"]
+    assert dkv["do_remote_prefill"] is True
+    assert dkv["do_remote_decode"] is False
+
+
+def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
     """Sanity: if NixlConnector silently produced no kv_transfer_params, fail
     fast rather than handing an empty dict to the decode peer."""
     server_cls = _import_http_server()
@@ -610,11 +689,13 @@ async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
     stub.generate = empty_prefill
 
     with pytest.raises(RuntimeError, match="no kv_transfer_params"):
-        await server_cls._pd_dispatch(
-            stub,
-            prompt_ids=[1],
-            sampling_params={"max_tokens": 8},
-            request_id="req-bare",
+        asyncio.run(
+            server_cls._pd_dispatch(
+                stub,
+                prompt_ids=[1],
+                sampling_params={"max_tokens": 8},
+                request_id="req-bare",
+            )
         )
 
 
