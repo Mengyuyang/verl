@@ -429,6 +429,8 @@ class _DispatchStub:
         self._pd_decode_peers = list(decode_peers)
         self._pd_decode_peer_ids = list(decode_peers)
         self._pd_router = router
+        self._pd_router_acquire_fields = ["prompt_ids"]
+        self._pd_router_release_fields = ["request_id"]
         self._pd_peer_idx = 0
         # Used by _pd_dispatch to branch between NIXL (read kv_transfer_params
         # back from prefill) and Mooncake (construct it locally from prefill
@@ -443,10 +445,12 @@ class _DispatchStub:
 
         return vLLMHttpServer._select_decode_peer(self)
 
-    async def _select_decode_peer_for_dispatch(self, routing_key, prompt_ids):
+    async def _select_decode_peer_for_dispatch(self, routing_key, prompt_ids, reservation_id=None):
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
-        return await vLLMHttpServer._select_decode_peer_for_dispatch(self, routing_key, prompt_ids)
+        return await vLLMHttpServer._select_decode_peer_for_dispatch(
+            self, routing_key, prompt_ids, reservation_id=reservation_id
+        )
 
     def _build_pd_decode_kv_params(self, prefill_out, connector, transfer_id, request_id):
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
@@ -459,10 +463,10 @@ class _DispatchStub:
             request_id,
         )
 
-    async def _release_pd_decode_peer(self, server_id, request_id):
+    async def _release_pd_decode_peer(self, server_id, request_id, reservation_id=None):
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
-        return await vLLMHttpServer._release_pd_decode_peer(self, server_id, request_id)
+        return await vLLMHttpServer._release_pd_decode_peer(self, server_id, request_id, reservation_id=reservation_id)
 
 
 def _import_http_server():
@@ -518,6 +522,7 @@ def test_router_selection_acquires_and_releases_peer():
     peer, server_id = asyncio.run(server_cls._select_decode_peer_for_dispatch(stub, "session-1", [1, 2, 3]))
     assert peer == "handle1"
     assert server_id == "peer1"
+    router.acquire_server.remote.assert_awaited_once_with(request_id="session-1", prompt_ids=[1, 2, 3])
     asyncio.run(server_cls._release_pd_decode_peer(stub, server_id, "session-1"))
     router.release_server.remote.assert_awaited_once_with(
         server_id="peer1",

@@ -56,7 +56,7 @@ def _remote(function):
     return types.SimpleNamespace(remote=invoke)
 
 
-@pytest.mark.parametrize("fields", [[], ["prompt_ids"]])
+@pytest.mark.parametrize("fields", [[], ["prompt_ids"], ["prompt_ids", "reservation_id"]])
 def test_decode_router_only_receives_declared_fields(fields):
     functions = _load_functions(SERVER, ["_select_decode_peer_for_dispatch"], "vLLMHttpServer")
     calls = []
@@ -74,14 +74,19 @@ def test_decode_router_only_receives_declared_fields(fields):
         _pd_decode_peers=[peer],
         _select_decode_peer=Mock(side_effect=AssertionError("unexpected fallback")),
     )
-    result = asyncio.run(functions._select_decode_peer_for_dispatch(stub, "session", [1, 2]))
+    result = asyncio.run(functions._select_decode_peer_for_dispatch(stub, "session", [1, 2], reservation_id="turn"))
     assert result == (peer, "d")
-    assert calls == [("session", {"prompt_ids": [1, 2]} if fields else {})]
+    assert calls == [
+        (
+            "session",
+            {key: value for key, value in {"prompt_ids": [1, 2], "reservation_id": "turn"}.items() if key in fields},
+        )
+    ]
     stub._select_decode_peer.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", ["success", "prefill_error", "decode_error", "cancelled"])
-@pytest.mark.parametrize("release_fields", [[], ["request_id"]])
+@pytest.mark.parametrize("release_fields", [[], ["request_id"], ["request_id", "reservation_id"]])
 def test_dispatch_releases_reservation_on_every_exit(outcome, release_fields):
     helper = _load_functions(SERVER, ["_build_mooncake_decode_kv_params"])
     methods = _load_functions(
@@ -128,8 +133,14 @@ def test_dispatch_releases_reservation_on_every_exit(outcome, release_fields):
         exception = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
         with pytest.raises(exception):
             asyncio.run(run())
-    select.assert_awaited_once_with("session", [1, 2])
-    release.assert_awaited_once_with(server_id="d", **({"request_id": "session"} if release_fields else {}))
+    assert select.await_count == 1
+    assert select.await_args.args == ("session", [1, 2])
+    reservation_id = select.await_args.kwargs["reservation_id"]
+    assert len(reservation_id) == 32
+    identity_fields = {"request_id": "session", "reservation_id": reservation_id}
+    release.assert_awaited_once_with(
+        server_id="d", **{key: value for key, value in identity_fields.items() if key in release_fields}
+    )
 
 
 @pytest.mark.parametrize("blocks", [None, [], (), [[]], [[], []], ([], [])])
@@ -307,3 +318,62 @@ def test_metrics_endpoints_cover_both_roles():
         ("d0:1", {"pd_role": "decode", "pd_index": 0}),
         ("d1:1", {"pd_role": "decode", "pd_index": 1}),
     ]
+
+
+def test_original_router_selection_test_matches_current_production_methods():
+    """Run the existing integration test body without importing the hardware stack."""
+    methods = _load_functions(
+        SERVER,
+        ["_select_decode_peer", "_select_decode_peer_for_dispatch", "_release_pd_decode_peer"],
+        "vLLMHttpServer",
+    )
+    test_path = "tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py"
+    stub_class = _load_functions(test_path, ["_DispatchStub"])._DispatchStub
+    # Replace only the deferred vLLM import inside the stub's fallback method.
+    stub_class._select_decode_peer = methods._select_decode_peer
+    test = _load_functions(
+        test_path,
+        ["test_router_selection_acquires_and_releases_peer"],
+        _DispatchStub=stub_class,
+        _import_http_server=lambda: methods,
+    ).test_router_selection_acquires_and_releases_peer
+    test()
+
+
+def test_concurrent_same_session_dispatches_have_distinct_matching_reservations():
+    methods = _load_functions(
+        SERVER,
+        ["_pd_dispatch", "_select_decode_peer_for_dispatch", "_release_pd_decode_peer", "_build_pd_decode_kv_params"],
+        "vLLMHttpServer",
+    )
+    acquire = AsyncMock()
+    release = AsyncMock()
+    decode = AsyncMock(return_value="generated")
+    peer = types.SimpleNamespace(generate=types.SimpleNamespace(remote=decode))
+    acquire.return_value = ("d", peer)
+    stub = types.SimpleNamespace(
+        _pd_router=types.SimpleNamespace(
+            acquire_server=types.SimpleNamespace(remote=acquire),
+            release_server=types.SimpleNamespace(remote=release),
+        ),
+        _pd_router_acquire_fields=["prompt_ids", "reservation_id"],
+        _pd_router_release_fields=["request_id", "reservation_id"],
+        _pd_decode_peer_ids=["d"],
+        _disaggregation_kv_transfer_config={"kv_connector": "NixlConnector"},
+        generate=AsyncMock(return_value=types.SimpleNamespace(extra_fields={"kv_transfer_params": {}})),
+    )
+    for name in ("_select_decode_peer_for_dispatch", "_release_pd_decode_peer", "_build_pd_decode_kv_params"):
+        setattr(stub, name, types.MethodType(getattr(methods, name), stub))
+
+    async def run():
+        return await asyncio.gather(
+            *[methods._pd_dispatch(stub, [1], {}, "same-request-id", session_id="session") for _ in range(2)]
+        )
+
+    assert asyncio.run(run()) == ["generated", "generated"]
+    acquired = [call.kwargs for call in acquire.await_args_list]
+    released = [call.kwargs for call in release.await_args_list]
+    assert all(call["request_id"] == "session" for call in acquired + released)
+    acquire_ids = {call["reservation_id"] for call in acquired}
+    assert len(acquire_ids) == 2
+    assert {call["reservation_id"] for call in released} == acquire_ids

@@ -938,6 +938,7 @@ class vLLMHttpServer:
         self,
         routing_key: str,
         prompt_ids: Sequence[int],
+        reservation_id: Optional[str] = None,
     ) -> tuple[ActorHandle, Optional[str]]:
         """Use the configured router, or the upstream round-robin selector."""
         if self._pd_router is None:
@@ -947,7 +948,10 @@ class vLLMHttpServer:
                 request_id=routing_key,
                 **{
                     name: value
-                    for name, value in {"prompt_ids": list(prompt_ids) if prompt_ids is not None else None}.items()
+                    for name, value in {
+                        "prompt_ids": list(prompt_ids) if prompt_ids is not None else None,
+                        "reservation_id": reservation_id,
+                    }.items()
                     if name in self._pd_router_acquire_fields
                 },
             )
@@ -986,13 +990,19 @@ class vLLMHttpServer:
             raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
         return dict(prefill_kv_params)
 
-    async def _release_pd_decode_peer(self, server_id: Optional[str], request_id: str) -> None:
+    async def _release_pd_decode_peer(
+        self, server_id: Optional[str], request_id: str, reservation_id: Optional[str] = None
+    ) -> None:
         if self._pd_router is None or server_id is None:
             return
         try:
             await self._pd_router.release_server.remote(
                 server_id=server_id,
-                **({"request_id": request_id} if "request_id" in self._pd_router_release_fields else {}),
+                **{
+                    name: value
+                    for name, value in {"request_id": request_id, "reservation_id": reservation_id}.items()
+                    if name in self._pd_router_release_fields
+                },
             )
         except Exception as exc:  # noqa: BLE001 - release errors are non-fatal
             logger.warning("PD decode router release failed: %s", exc)
@@ -1018,9 +1028,13 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Reserve a decode peer, run prefill locally, then dispatch decode."""
         effective_routing_key = session_id or request_id
+        # Session affinity and per-call accounting are separate. A retry or
+        # concurrent turn in the same session must not release another call.
+        reservation_id = uuid.uuid4().hex
         decode_peer, decode_peer_id = await self._select_decode_peer_for_dispatch(
             effective_routing_key,
             prompt_ids,
+            reservation_id=reservation_id,
         )
         try:
             connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
@@ -1069,7 +1083,7 @@ class vLLMHttpServer:
                 session_id=session_id,
             )
         finally:
-            await self._release_pd_decode_peer(decode_peer_id, effective_routing_key)
+            await self._release_pd_decode_peer(decode_peer_id, effective_routing_key, reservation_id=reservation_id)
 
     @RLInsightLogger.trace_state_decorator(
         "wake_up", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()

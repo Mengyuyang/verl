@@ -1,14 +1,15 @@
 # Ascend PD integration: final-local fork review
 
-Last updated: 10/23/2026.
+Last updated: 10/31/2026.
 
 ## Scope and source
 
 This revision follows `uni-agent1013-dr-final-local.rar`, SHA256
 `8AF98361FE5C19978106076F1B637687DC179F3A72ED656AD617FDA54124F9D5`.
 Its verl baseline is `263653e749306287a5032140cce3d7833c1959d0`;
-this PR targets the fork main synchronized to upstream
-`d430157d15516d89e0cc853fd10fcd21d9234c44`.
+this PR now includes the current fork main at
+`59f9a42c749a49793ee38298f3081beab43d79bc`. The October 31 update merges
+that main into the PR branch; it does not push or rewrite main.
 
 Compared with the previous PR revision, the final source reduces the integration
 surface. The runtime changes are limited to `llm_server.py`,
@@ -85,11 +86,27 @@ model/training/resource settings for the actual environment.
 - Close already acquired sockets if a later port-range reservation fails.
 - Extend CPU contracts and retain the source's minimal integration tests.
 
+## October 31 correctness fixes
+
+- Fix the original `_DispatchStub` to declare acquire/release fields. It
+  bypasses the real server constructor, so the previously missing fields caused
+  fallback to RR and skipped release. A new CPU contract executes that existing
+  test body with the actual production methods, without the heavy runtime import.
+- Give each `_pd_dispatch` a unique `reservation_id`, forwarded on acquire and
+  finally-release only when the router declares it. `request_id` at the router
+  remains the affinity key. Routers declaring only the earlier fields keep
+  their existing call signatures and routing behavior.
+- The companion Uni-Agent adapter uses this identity for exact prompt-weight
+  release rather than FIFO, including concurrent calls in the same session.
+  Upgrade both PRs together. Without the new identity, its fallback request ID
+  must be unique among active calls. Membership changes require drain; no
+  guarantee is made for lost acquire replies or actor failures.
+
 ## Validation and remaining merge gates
 
 ```bash
 python -m pytest -q tests/workers/rollout/test_pd_contracts_on_cpu.py --noconftest
-# 32 passed
+# 39 passed
 python -m pytest -q tests/workers/rollout/test_pd_minimal_custom_on_cpu.py tests/workers/rollout/test_pd_disaggregation.py tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py --noconftest --maxfail=1
 ```
 
@@ -97,6 +114,11 @@ The second command failed during Windows PyTorch collection with WinError 1114
 loading c10.dll. It is not counted as passing. AST contracts execute production
 methods with fake remote calls; they do not prove engine startup or transport.
 Hardware and complete application validation remain pending.
+The 39 passing contracts now include the previously mismatched original router
+test, declared-field compatibility, unique concurrent reservations and release
+identity on normal/error/cancellation exits. Paired Python-method checks with
+the actual Uni-Agent adapter passed for short-first completion and cancellation
+(`11000 -> 10000 -> 0`); these are not transport/engine integration tests.
 
 Changed-file Ruff, formatting, mypy, generated-config verification and the
 other pre-commit checks passed, except two local Windows hook failures: the
@@ -108,8 +130,9 @@ allowlist was changed to mask these failures.
 
 Before merge:
 
-- Resolve optional session-sticky FIFO token-release accounting. Its new
-  adapter still ignores request identity at release; moving it does not fix it.
+- Verify paired deployment of the request-exact adapter, drain-aware pool
+  changes, and recovery from lost acquire replies / actor failure. Direct legacy
+  selector callers without reservation identity retain their FIFO API.
 - Verify whole P-to-D drain, abort/resume, partial rollout, weight synchronization,
   sleep/wake and the separate `release_kv_cache` path. The shared sleep drain
   still observes the first engine; it does not prove all D work completed.
