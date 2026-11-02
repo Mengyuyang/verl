@@ -1833,15 +1833,10 @@ class vLLMReplica(RolloutReplica):
             else f"{server_address}:{server_port}"
         )
 
-    async def _before_server_sleep(self):
-        """Optional hook after request drain and before engine sleep."""
-        return None
-
     async def sleep(self):
         """Sleep each rollout server."""
         # Drain DP engines for safe sleep.
         await self.servers[0].wait_for_requests_to_drain.remote()
-        await self._before_server_sleep()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def abort_all_requests(

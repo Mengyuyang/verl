@@ -276,16 +276,6 @@ class vLLMPDReplica(vLLMReplica):
         await asyncio.gather(*[server.resume_engine_generation.remote() for server in self.servers])
         await asyncio.gather(*[server.open_submission_gate.remote() for server in self.servers])
 
-    async def _before_server_sleep(self):
-        """Disconnect Ascend KV peers after drain and before engine sleep."""
-        # The transfer initiator owns the peer connection. Complete the
-        # disconnect RPC on every P/D engine before any engine can unregister
-        # and unmap its KV buffers.
-        if self._is_ascend_platform():
-            await asyncio.gather(
-                *[server.collective_rpc.remote(method="disconnect_kv_transfer_peers") for server in self.servers]
-            )
-
     @staticmethod
     def _is_ascend_platform() -> bool:
         """Follow Verl's existing NPU availability convention."""

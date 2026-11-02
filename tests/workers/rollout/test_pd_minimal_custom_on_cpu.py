@@ -14,6 +14,7 @@
 """CPU tests for the reduced-surface Ascend P/D implementation."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -99,19 +100,19 @@ def test_non_pd_resume_keeps_upstream_order():
         server.resume_generation.remote.assert_not_awaited()
 
 
-def test_shared_sleep_runs_pre_sleep_hook():
+def test_pd_sleep_uses_worker_lifecycle_without_peer_disconnect_rpc(monkeypatch):
     pytest.importorskip("vllm")
-    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
 
-    server = MagicMock()
-    server.wait_for_requests_to_drain.remote = AsyncMock()
-    server.sleep.remote = AsyncMock()
-    replica = object.__new__(vLLMReplica)
+    server = SimpleNamespace(
+        wait_for_requests_to_drain=SimpleNamespace(remote=AsyncMock()),
+        sleep=SimpleNamespace(remote=AsyncMock()),
+    )
+    replica = object.__new__(vLLMPDReplica)
     replica.servers = [server]
-    replica._before_server_sleep = AsyncMock()
+    monkeypatch.setattr(vLLMPDReplica, "_is_ascend_platform", staticmethod(lambda: True))
 
-    asyncio.run(vLLMReplica.sleep(replica))
+    asyncio.run(replica.sleep())
 
     server.wait_for_requests_to_drain.remote.assert_awaited_once()
-    replica._before_server_sleep.assert_awaited_once()
     server.sleep.remote.assert_awaited_once()

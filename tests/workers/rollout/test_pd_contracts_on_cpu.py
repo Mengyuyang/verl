@@ -224,32 +224,49 @@ def test_port_ranges_are_contiguous_and_disjoint():
         reserve("127.0.0.1", 0)
 
 
-def test_sleep_drains_then_disconnects_all_peers_before_sleep():
+@pytest.mark.parametrize("ascend", [False, True])
+def test_sleep_uses_worker_lifecycle_without_peer_disconnect_rpc(ascend):
     sleep = _load_functions(SERVER, ["sleep"], "vLLMReplica").sleep
-    hook = _load_functions(REPLICA, ["_before_server_sleep"], "vLLMPDReplica")._before_server_sleep
     events = []
 
     def server(name):
+        # A strict interface: never invent collective_rpc or a disconnect API.
         return types.SimpleNamespace(
             wait_for_requests_to_drain=_remote(lambda: events.append(("drain", name))),
-            collective_rpc=_remote(lambda **kw: events.append((kw["method"], name))),
             sleep=_remote(lambda: events.append(("sleep", name))),
         )
 
     prefill, decode = server("p"), server("d")
     stub = types.SimpleNamespace(
         servers=[prefill, decode],
-        _is_ascend_platform=lambda: True,
+        _is_ascend_platform=lambda: ascend,
     )
-    stub._before_server_sleep = types.MethodType(hook, stub)
+    # Exercise any inherited/overridden hook still present in the source. This
+    # regression must fail on the old PD hook, rather than omitting it in a stub.
+    for path, owner in ((SERVER, "vLLMReplica"), (REPLICA, "vLLMPDReplica")):
+        tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+        owner_node = next(node for node in tree.body if getattr(node, "name", None) == owner)
+        if any(getattr(node, "name", None) == "_before_server_sleep" for node in owner_node.body):
+            hook = _load_functions(path, ["_before_server_sleep"], owner)._before_server_sleep
+            stub._before_server_sleep = types.MethodType(hook, stub)
     asyncio.run(sleep(stub))
     assert events == [
         ("drain", "p"),
-        ("disconnect_kv_transfer_peers", "p"),
-        ("disconnect_kv_transfer_peers", "d"),
         ("sleep", "p"),
         ("sleep", "d"),
     ]
+
+
+def test_sleep_propagates_worker_failure():
+    sleep = _load_functions(SERVER, ["sleep"], "vLLMReplica").sleep
+    failure = AsyncMock(side_effect=RuntimeError("worker memory unregistration failed"))
+    server = types.SimpleNamespace(
+        wait_for_requests_to_drain=types.SimpleNamespace(remote=AsyncMock()),
+        sleep=types.SimpleNamespace(remote=failure),
+    )
+    with pytest.raises(RuntimeError, match="worker memory unregistration failed"):
+        asyncio.run(sleep(types.SimpleNamespace(servers=[server])))
+    failure.assert_awaited_once()
 
 
 def test_no_router_keeps_round_robin():

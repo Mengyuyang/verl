@@ -1,6 +1,6 @@
 # Ascend PD integration: final-local fork review
 
-Last updated: 10/31/2026.
+Last updated: 11/02/2026.
 
 ## Scope and source
 
@@ -19,7 +19,7 @@ APIs and the Prometheus label merger are restored to upstream.
 
 Basic single-node 1P+ND and asymmetric TP already existed in upstream.
 This change adds Ascend connector/ports, optional standard-router integration,
-Ascend metrics discovery and KV lifecycle hooks; it does not invent PD itself.
+Ascend metrics discovery and cache-invalidation notifications; it does not invent PD itself.
 
 ## Configuration migration
 
@@ -67,9 +67,10 @@ model/training/resource settings for the actual environment.
    runs D, and releases in finally. GPU Mooncake retains upstream handshake
    semantics; Ascend V1 preserves P block metadata and computes locally when
    no transferable blocks are available. NIXL rejects missing metadata.
-4. Cache-invalidating server operations clear router affinity. Shared replica
-   sleep invokes an optional `_before_server_sleep` hook after its drain;
-   the PD override disconnects all Ascend KV peers before sleep.
+4. Cache-invalidating server operations clear router affinity. Replica sleep
+   uses the normal engine sleep/wake lifecycle. The supported Ascend worker
+   unregisters Mooncake buffers before allocator sleep and re-registers them
+   when the KV pool wakes; verl does not issue a separate peer-disconnect RPC.
 5. `llm_server.py` exposes P+D metrics addresses only for Ascend PD. RLInsight
    receives role labels. Prometheus receives the addresses but this revision
    does **not** add the former custom static role-label merger.
@@ -102,26 +103,65 @@ model/training/resource settings for the actual environment.
   must be unique among active calls. Membership changes require drain; no
   guarantee is made for lost acquire replies or actor failures.
 
+## November 2 Mooncake lifecycle compatibility
+
+[vLLM-Ascend #20213](https://github.com/vllm-project/vllm-ascend/pull/20213),
+merged as `bf2adf65130ffd6b7bb3ef77ba2b50122d6a62fe`, fixes
+[issue #20160](https://github.com/vllm-project/vllm-ascend/issues/20160).
+It removes `disconnect_kv_transfer_peers` and the unsupported
+`TransferEngine.disconnect_all_peers` call. The inspected Mooncake Ascend Direct
+revision `811c97f` calls `disconnectAllForEngine` inside memory deregistration.
+
+verl no longer adds a PD pre-sleep override or a shared pre-sleep hook. It does
+not replace them with a driver-side unregister call, an API-existence fallback,
+or an exception handler that allows sleep after failed buffer unregistration.
+`NPUWorker.sleep` owns `GlobalTE.unregister_buffer` before allocator sleep;
+`wake_up(tags=["weights"])` leaves KV unregistered, while waking `kv_cache`
+restores registration. MooncakeConnectorV1 registers its KV buffers through the
+same GlobalTE in the inspected Ascend source.
+
+Use a vLLM-Ascend revision containing this fix (or an equivalent official
+backport), together with a compatible Mooncake Ascend Direct build. This is not
+a guarantee for older Mooncake revisions, other transports, or an arbitrary
+binary advertised by a version string. The original issue used AscendStore;
+shared source ownership links the V1 path, but real V1 PD validation is still
+required. No private disconnect patch is required by the revised verl code.
+
+CPU regressions use servers with only the supported drain/sleep interface,
+check both platform branches, and preserve worker-error propagation. The old
+Ascend hook fails this regression; fake methods do not certify native transfers.
+The existing first-engine drain remains unchanged and is not a complete P-to-D
+barrier. Closing admission and draining every leg before sleep/weight sync
+remain separate validation requirements.
+
 ## Validation and remaining merge gates
 
 ```bash
 python -m pytest -q tests/workers/rollout/test_pd_contracts_on_cpu.py --noconftest
-# 39 passed
+# November 2 local result: 41 passed (Python 3.11.14)
 python -m pytest -q tests/workers/rollout/test_pd_minimal_custom_on_cpu.py tests/workers/rollout/test_pd_disaggregation.py tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py --noconftest --maxfail=1
 ```
 
-The second command failed during Windows PyTorch collection with WinError 1114
-loading c10.dll. It is not counted as passing. AST contracts execute production
+The second command previously failed during Windows PyTorch collection with
+WinError 1114 loading c10.dll; it was not rerun for the November 2 update and is
+not counted as passing. AST contracts execute production
 methods with fake remote calls; they do not prove engine startup or transport.
 Hardware and complete application validation remain pending.
-The 39 passing contracts now include the previously mismatched original router
+The 41 passing contracts include the previously mismatched original router
 test, declared-field compatibility, unique concurrent reservations and release
 identity on normal/error/cancellation exits. Paired Python-method checks with
 the actual Uni-Agent adapter passed for short-first completion and cancellation
-(`11000 -> 10000 -> 0`); these are not transport/engine integration tests.
+(`11000 -> 10000 -> 0`) in the October 31 verification; these are not
+transport/engine integration tests. The November 2 regression fails on the old
+Ascend hook and passes after its removal; worker sleep failures still propagate.
 
-Changed-file Ruff, formatting, mypy, generated-config verification and the
-other pre-commit checks passed, except two local Windows hook failures: the
+The November 2 update passed changed-file Ruff 0.12.2, its format check, and
+Python 3.11 compilation. The complete pre-commit suite and hardware tests were
+not rerun for this update.
+
+In the October 31 verification, changed-file Ruff, formatting, mypy,
+generated-config verification and the other pre-commit checks passed, except
+two local Windows hook failures: the
 test-structure allowlist uses POSIX paths, and the compileall hook selected an
 older Python that cannot parse upstream match statements. Explicit Python 3.12
 compileall passed, as did the structure check with the same three upstream
@@ -136,8 +176,10 @@ Before merge:
 - Verify whole P-to-D drain, abort/resume, partial rollout, weight synchronization,
   sleep/wake and the separate `release_kv_cache` path. The shared sleep drain
   still observes the first engine; it does not prove all D work completed.
-- Verify matched dependencies providing MooncakeConnectorV1 and
-  `disconnect_kv_transfer_peers`. Final-local contains no `deps` tree.
+- Verify matched dependencies providing MooncakeConnectorV1 and the supported
+  worker-owned unregister/sleep/reregister lifecycle described above. The
+  removed `disconnect_kv_transfer_peers` RPC must not be a deployment prerequisite.
+  Final-local contains no `deps` tree.
   The previous archive's empty-group/completion fixes cannot be assumed to be
   present in the installed runtime.
 - Releasing reserved ports before child bind still leaves cross-job races.
