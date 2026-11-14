@@ -188,12 +188,15 @@ def test_pd_resume_failure_keeps_all_gates_closed():
     open_gate.assert_not_awaited()
 
 
-def test_ascend_connector_config_carries_asymmetric_tp():
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_ascend_connector_config_carries_asymmetric_tp(role):
     build = _load_functions(REPLICA, ["_build_kv_transfer_config"], "vLLMPDReplica", get_device_name=lambda: "npu")
     cfg = build._build_kv_transfer_config(
-        "prefill", "p", "mooncake", use_ascend_mooncake_v1=True, kv_port=39000, prefill_tp=4, decode_tp=2
+        role, role, "mooncake", use_ascend_mooncake_v1=True, kv_port=39000, prefill_tp=4, decode_tp=2
     )
     assert cfg["kv_connector"] == "MooncakeConnectorV1"
+    assert cfg["kv_role"] == {"prefill": "kv_producer", "decode": "kv_consumer"}[role]
+    assert cfg["engine_id"] == role
     assert cfg["kv_buffer_device"] == "npu"
     assert cfg["kv_port"] == 39000
     assert cfg["kv_connector_extra_config"] == {
