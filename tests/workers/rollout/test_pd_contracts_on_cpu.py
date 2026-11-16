@@ -221,7 +221,16 @@ def test_manager_registers_metrics_separately_from_request_routing(name, device,
         update_prometheus.assert_not_called()
 
 
-@pytest.mark.parametrize("fields", [[], ["prompt_ids"], ["prompt_ids", "reservation_id"]])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        [],
+        ["prompt_ids"],
+        ["prompt_ids", "reservation_id"],
+        ["sampling_params", "priority", "session_id"],
+        ["image_data", "video_data", "audio_data", "mm_processor_kwargs"],
+    ],
+)
 def test_decode_router_only_receives_declared_fields(fields):
     functions = _load_functions(SERVER, ["_select_decode_peer_for_dispatch"], "vLLMHttpServer")
     calls = []
@@ -239,12 +248,27 @@ def test_decode_router_only_receives_declared_fields(fields):
         _pd_decode_peers=[peer],
         _select_decode_peer=Mock(side_effect=AssertionError("unexpected fallback")),
     )
-    result = asyncio.run(functions._select_decode_peer_for_dispatch(stub, "session", [1, 2], reservation_id="turn"))
+    generation = {
+        "sampling_params": {"max_tokens": 20},
+        "priority": 7,
+        "session_id": "session",
+        "image_data": ["image"],
+        "video_data": ["video"],
+        "audio_data": ["audio"],
+        "mm_processor_kwargs": {"fps": 1},
+    }
+    result = asyncio.run(
+        functions._select_decode_peer_for_dispatch(stub, "session", [1, 2], reservation_id="turn", **generation)
+    )
     assert result == (peer, "d")
     assert calls == [
         (
             "session",
-            {key: value for key, value in {"prompt_ids": [1, 2], "reservation_id": "turn"}.items() if key in fields},
+            {
+                key: value
+                for key, value in {**generation, "prompt_ids": [1, 2], "reservation_id": "turn"}.items()
+                if key in fields
+            },
         )
     ]
     stub._select_decode_peer.assert_not_called()
@@ -300,12 +324,85 @@ def test_dispatch_releases_reservation_on_every_exit(outcome, release_fields):
             asyncio.run(run())
     assert select.await_count == 1
     assert select.await_args.args == ("session", [1, 2])
+    assert select.await_args.kwargs["sampling_params"] == {"max_tokens": 20}
+    assert generate.await_args.args[1]["max_tokens"] == 1
     reservation_id = select.await_args.kwargs["reservation_id"]
     assert len(reservation_id) == 32
     identity_fields = {"request_id": "session", "reservation_id": reservation_id}
     release.assert_awaited_once_with(
         server_id="d", **{key: value for key, value in identity_fields.items() if key in release_fields}
     )
+
+
+@pytest.mark.parametrize("repeat_cancel", [None, "acquire", "release"])
+def test_pending_acquire_cancellation_releases_after_reply(repeat_cancel):
+    methods = _load_functions(
+        SERVER, ["_pd_dispatch", "_select_decode_peer_for_dispatch", "_release_pd_decode_peer"], "vLLMHttpServer"
+    )
+
+    async def run():
+        recorded, reply, releasing, release_reply = [asyncio.Event() for _ in range(4)]
+        reservations = {}
+        remote_tasks = []
+        peer = object()
+
+        async def acquire(request_id, prompt_ids, reservation_id):
+            assert prompt_ids == [1]
+            reservations[reservation_id] = "d"
+            recorded.set()
+            await reply.wait()
+            return "d", peer
+
+        def remote_acquire(**kwargs):
+            task = asyncio.create_task(acquire(**kwargs))
+            remote_tasks.append(task)
+            # Like a Ray ObjectRef: cancelling the waiter does not stop remote work.
+            return asyncio.shield(task)
+
+        async def release(server_id, request_id, reservation_id):
+            releasing.set()
+            await release_reply.wait()
+            assert request_id == "session"
+            assert reservations.pop(reservation_id) == server_id
+
+        release_call = AsyncMock(side_effect=release)
+        stub = types.SimpleNamespace(
+            _pd_router=types.SimpleNamespace(
+                acquire_server=types.SimpleNamespace(remote=remote_acquire),
+                release_server=types.SimpleNamespace(remote=release_call),
+            ),
+            _pd_router_acquire_fields=["prompt_ids", "reservation_id"],
+            _pd_router_release_fields=["request_id", "reservation_id"],
+            _pd_decode_peer_ids=["d"],
+            _select_decode_peer=Mock(side_effect=AssertionError("unexpected fallback")),
+            generate=AsyncMock(side_effect=AssertionError("cancelled request must not run prefill")),
+        )
+        for name in ("_select_decode_peer_for_dispatch", "_release_pd_decode_peer"):
+            setattr(stub, name, types.MethodType(getattr(methods, name), stub))
+        dispatch = asyncio.create_task(
+            methods._pd_dispatch(stub, [1], {"max_tokens": 20}, "turn", session_id="session")
+        )
+        await asyncio.wait_for(recorded.wait(), 1)
+        dispatch.cancel("request cancelled")
+        # Let the first cancellation enter cleanup before issuing another.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        if repeat_cancel == "acquire":
+            dispatch.cancel()
+        assert not remote_tasks[0].cancelled()
+        reply.set()
+        await asyncio.wait_for(releasing.wait(), 1)
+        if repeat_cancel == "release":
+            dispatch.cancel()
+        release_reply.set()
+        with pytest.raises(asyncio.CancelledError, match="request cancelled"):
+            await asyncio.wait_for(dispatch, 1)
+        await asyncio.gather(*remote_tasks)
+        assert reservations == {}
+        assert release_call.await_count == 1
+        stub.generate.assert_not_awaited()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("blocks", [None, [], (), [[]], [[], []], ([], [])])
