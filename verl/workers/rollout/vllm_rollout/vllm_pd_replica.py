@@ -186,11 +186,12 @@ class vLLMPDReplica(vLLMReplica):
                     decode_tp=self._decode_tp,
                 )
                 # Keep the existing actor name for 1P callers and weight adapters.
-                actor_name = (
-                    f"vllm_server_{self.replica_rank}_0{self.name_suffix}"
-                    if self._n_prefill == 1
-                    else f"vllm_server_prefill_{self.replica_rank}_{i}_0{self.name_suffix}"
-                )
+                # 单 P 沿用旧名称，兼容原有调用方；多个 P 在名字中加入下标 i，避免重名。
+                # 名称末尾的 _0 是单机服务的节点编号，name_suffix 是额外的实例后缀。
+                if self._n_prefill == 1:
+                    actor_name = f"vllm_server_{self.replica_rank}_0{self.name_suffix}"
+                else:
+                    actor_name = f"vllm_server_prefill_{self.replica_rank}_{i}_0{self.name_suffix}"
                 # 把引擎在“整组”中的起点传给权重接收端。例如 P1 的起点为4，内部TP-local2对应整组rank6。
                 server = self._spawn_pd_server(
                     role="prefill",
