@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 import zlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -44,7 +44,12 @@ from vllm.v1.metrics.loggers import PrometheusStatLogger
 
 from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
+from verl.utils.device import (
+    get_device_name,
+    get_resource_name,
+    get_visible_devices_keyword,
+    is_torch_npu_available,
+)
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import (
     build_rollout_dist_profiler,
@@ -101,6 +106,62 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+# 【讲解入口 4：一次请求经过哪里】本文件里的 vLLMHttpServer 代表一个独立 P 或 D 引擎。
+# 外层 client 选 P → generate 进入 _pd_dispatch → 选本组 D → P生成KV → D接手生成 → 释放路由记账。
+# 理解这条链路时区分三类东西：Ray句柄负责调用，KV参数负责描述交接，Connector负责实际搬运KV。
+# 下面的辅助函数目前仅由 Ascend MooncakeConnectorV1 分支调用；GPU Mooncake 的参数分支另写。
+def _build_mooncake_decode_kv_params(
+    prefill_kv_params: Optional[Mapping[str, Any]],
+    *,
+    remote_engine_id: str,
+    remote_bootstrap_addr: str,
+    transfer_id: str,
+) -> dict[str, Any]:
+    """Build decode-side Mooncake params from the completed prefill leg."""
+    # P 返回的 kv_transfer_params 是交接元数据，例如远端引擎、块编号、请求ID、主机和端口。
+    # remote_block_ids 是 P 侧缓存块的编号，不是 KV 张量本身；不能把这一步当作已完成数据复制。
+    # None/空映射转为空字典，再浅拷贝顶层，避免下面给参数赋值时改动原始字典的顶层字段。
+    params = dict(prefill_kv_params or {})
+    # setdefault 只补“键不存在”的值：Connector 已返回的 remote_engine_id/引导地址/transfer_id 优先。
+    # 已有键即使值为None也不会被替换；这三行不等于做了完整元数据有效性校验。
+    # 后面的 do_remote_* 会按块情况重新赋值，因此“返回值优先”只针对这里的默认字段。
+    params.setdefault("remote_engine_id", remote_engine_id)
+    params.setdefault("remote_bootstrap_addr", remote_bootstrap_addr)
+    params.setdefault("transfer_id", transfer_id)
+
+    # A prefill request that stops before producing transferable blocks (for
+    # example, because its first sampled token is EOS) returns no
+    # remote_block_ids. Advertising a remote prefill in that case makes the
+    # Mooncake scheduler assert num_external_tokens == 0 and kills the engine.
+    # Fall back to computing the prompt locally on decode instead.
+    # 【有无块的防御检查】字段缺失、None、[] 都统一变成空元组，方便后面安全遍历。
+    # P 提前结束且没有交出可传块时，不能仍向 D 声明“已有远端KV供你接收”。
+    # 注释中的EOS是一个历史触发例子；真正的判断条件是块列表，不是是否看到了EOS。
+    blocks = params.get("remote_block_ids") or ()
+    # A nonempty container of empty KV groups is not transferable. Block ID
+    # zero is valid, so do not use the truth value of each scalar block ID.
+    # 按接口约定兼容两种结构：[0,5] 是块编号列表，[[0,5],[]] 是按KV缓存组组织的块编号。
+    # any 表示“至少有一项”：项是list/tuple时检查组非空；项是标量块ID时直接算有块。
+    # []、[[]]、[[],[]] → 无块；[0]、[[0]]、[[],[5]] → 有块。0 是合法块号，不能按 bool(0) 判空。
+    # 这里假设上游标量确实是块ID，只检查是否有块，不验证所有组完整性或保证传输一定成功。
+    if any(bool(block) if isinstance(block, list | tuple) else True for block in blocks):
+        # 这些标志站在接收参数的 D 的角度读：prefill 来自远端 P，D 要走接收远端KV的分支。
+        # do_remote_decode=False 不表示停止生成，只表示这次不再承担“本机P把decode交给别处”的角色。
+        params["do_remote_prefill"] = True
+        params["do_remote_decode"] = False
+    else:
+        logger.warning(
+            "Mooncake prefill returned no remote blocks; decoding the prompt locally (engine_id=%s, transfer_id=%s)",
+            remote_engine_id,
+            transfer_id,
+        )
+        # 没有块：D 按普通本地流程处理 prompt，再继续生成；本地前缀缓存能否复用仍由引擎决定。
+        # 关闭远端prefill声明，避免底层算出要接收外部token，却没有对应远端块而触发断言。
+        params["do_remote_prefill"] = False
+        params["do_remote_decode"] = False
+    return params
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -141,12 +202,22 @@ class vLLMHttpServer:
             raise ValueError(
                 f"disaggregation_role={disaggregation_role!r} requires disaggregation_kv_transfer_config to be set"
             )
+        # 【单引擎的角色与状态】本actor只代表一个P或一个D；N/M个引擎由 vLLMPDReplica 统一创建。
+        # _pd_decode_peers 是组内D句柄，_pd_router 是可选策略actor，_pd_peer_idx 是本P自己的轮询游标。
+        # 这些字段按P分别保存，不提供跨P共享的D负载账本。
         self._disaggregation_role = disaggregation_role
         self._disaggregation_kv_transfer_config = disaggregation_kv_transfer_config
         # Filled by vLLMPDReplica.set_pd_peer for prefill-side routing.
         self._pd_decode_peers: list[ActorHandle] = []
         self._pd_prefill_side_channel_port: Optional[int] = None
         self._pd_prefill_engine_id: Optional[str] = None
+        # PD decode routing is owned by verl's upstream router. The strategy
+        # config lives in rollout.custom so no PD-specific schema is required.
+        self._pd_router: Any = None
+        self._pd_router_kind: str = "round_robin"
+        self._pd_router_acquire_fields: list[str] = []
+        self._pd_router_release_fields: list[str] = []
+        self._pd_decode_peer_ids: list[str] = []
         self._pd_peer_idx: int = 0
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
@@ -287,9 +358,64 @@ class vLLMHttpServer:
             f"set_pd_peer must be called on the prefill server (got role={self._disaggregation_role!r})"
         )
         assert isinstance(decode_peers, list) and decode_peers, "decode_peers must be a non-empty list"
+        # 【P 与 D 建立关系】启动器对每个 P 调一次这里，交给它整组全部 D 的句柄。
+        # prefill_engine_id / side_channel_port 保存的是当前这个 P 的身份和交接地址。
         self._pd_decode_peers = list(decode_peers)
         self._pd_prefill_side_channel_port = prefill_side_channel_port
         self._pd_prefill_engine_id = prefill_engine_id
+        decode_peer_ids = []
+        router_config_path = None
+        if get_device_name() == "npu":
+            # Ascend 可选路由器用 D 的 HTTP 地址作 server_id；SessionSticky 也用该地址轮询 /metrics。
+            # 真正生成请求仍通过 Ray ActorHandle 调用，不是把所有请求改成 HTTP 转发。
+            decode_addresses = await asyncio.gather(
+                *[decode_peer.get_server_address.remote() for decode_peer in decode_peers]
+            )
+            decode_peer_ids = [
+                f"http://[{host}]:{port}" if is_valid_ipv6_address(host) else f"http://{host}:{port}"
+                for host, port in decode_addresses
+            ]
+            router_config_path = (self.config.custom or {}).get("pd_router_config_path")
+        self._pd_decode_peer_ids = decode_peer_ids
+        if router_config_path and get_device_name() == "npu":
+            try:
+                from verl.workers.rollout.router import get_router_handle
+
+                # 当前只有 NPU 且配置 custom.pd_router_config_path 时启用这层策略。
+                # YAML 在执行 set_pd_peer 的 P actor 中读取，再创建 router actor，所以文件必须对 P 可读。
+                # UniAgent 提供 SelectorRouter/策略；verl 提供调用协议、P/D编排与KV参数。
+                self._pd_router = get_router_handle(
+                    dict(zip(decode_peer_ids, decode_peers, strict=True)),
+                    router_config_path=router_config_path,
+                    full_determinism=getattr(self.config, "full_determinism", False),
+                )
+                # 问插件“选择时需要什么字段、释放时需要什么字段”，把声明缓存起来供每次请求过滤参数。
+                # 当前 UniAgent 声明 acquire=[prompt_ids,reservation_id]、release=[request_id,reservation_id]。
+                # 其他插件若按每次调用记账，也需要在两侧声明reservation_id；会话键不能代替每次调用ID。
+                acquire_fields, release_fields = await asyncio.gather(
+                    self._pd_router.require_acquire_fields.remote(),
+                    self._pd_router.require_release_fields.remote(),
+                )
+                self._pd_router_acquire_fields = list(acquire_fields)
+                self._pd_router_release_fields = list(release_fields)
+                self._pd_router_kind = "configured"
+            except Exception as exc:  # noqa: BLE001 - router failure must not stop PD startup
+                logger.warning(
+                    "PD decode router %r failed to build; falling back to round-robin: %s",
+                    router_config_path,
+                    exc,
+                )
+                self._pd_router = None
+                self._pd_router_kind = "round_robin(fallback)"
+        else:
+            self._pd_router = None
+            self._pd_router_kind = "round_robin"
+        logger.info(
+            "PD decode selector: %s (router_config_path=%s, candidates=%d)",
+            self._pd_router_kind,
+            router_config_path,
+            len(self._pd_decode_peer_ids),
+        )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -610,6 +736,9 @@ class vLLMHttpServer:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
             session_id: Sticky caller id; turns of one session go to the same DP engine.
         """
+        # 【请求第2跳：P识别完整请求】只有P、已配置D、且没有KV阶段参数时，才进入完整PD调度。
+        # _pd_dispatch 稍后会再次调用 self.generate，但那次带了KV参数，因此直接执行P阶段，不会无限递归。
+        # D收到参数后也走自己的引擎执行路径，最终由Connector读取KV交接信息。
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -846,9 +975,104 @@ class vLLMHttpServer:
 
     def _select_decode_peer(self) -> ActorHandle:
         """Round-robin across decode peers."""
+        # 【默认D选择】%取余实现循环下标：两个D时，游标0/1/2/3得到下标0/1/0/1。
+        # 这是每个P各自的轮询，不感知别的P给D派了多少请求。
         peer = self._pd_decode_peers[self._pd_peer_idx % len(self._pd_decode_peers)]
         self._pd_peer_idx += 1
         return peer
+
+    async def _select_decode_peer_for_dispatch(
+        self,
+        routing_key: str,
+        prompt_ids: Sequence[int],
+        reservation_id: Optional[str] = None,
+        **generation_kwargs: Any,
+    ) -> tuple[ActorHandle, Optional[str]]:
+        """Use the configured router, or the upstream round-robin selector."""
+        # 【可选D选择】没有策略actor时走轮询；返回的None是“后续不调用路由器release”的标记。
+        # 返回值顺序是 (D的Ray句柄, D在路由器中的server_id)，不是 (地址,端口)。
+        if self._pd_router is None:
+            return self._select_decode_peer(), None
+        try:
+            # acquire 是“选择并记账”，不会在此处执行D生成；真正调用D在 _pd_dispatch 的最后。
+            # request_id=routing_key 在插件协议中用来保持会话亲和；本次调用的身份另用 reservation_id。
+            # 字典推导式先汇总生成参数，再只保留插件声明需要的字段；** 把字典展开成关键字参数。
+            # 例如声明只要prompt_ids/reservation_id时，不会把sampling_params、图片等额外字段发给该插件。
+            server_id, handle = await self._pd_router.acquire_server.remote(
+                request_id=routing_key,
+                **{
+                    name: value
+                    for name, value in {
+                        **generation_kwargs,
+                        "prompt_ids": list(prompt_ids) if prompt_ids is not None else None,
+                        "reservation_id": reservation_id,
+                    }.items()
+                    if name in self._pd_router_acquire_fields
+                },
+            )
+        # 明确返回的路由RPC异常会记录日志并回退轮询；调用永远不返回时并不会自动进入except。
+        # 返回丢失时插件可能已经记过账，当前没有分布式租约恢复机制，不能将此回退视为事务回滚。
+        except Exception as exc:  # noqa: BLE001 - router failure must not break rollout
+            logger.warning("PD decode router failed; falling back to round-robin: %s", exc)
+            return self._select_decode_peer(), None
+        # 插件只能返回本P登记的D标识；未知标识直接报错，避免把请求派到组外服务。
+        if server_id not in self._pd_decode_peer_ids:
+            raise RuntimeError(f"decode router returned unknown server: {server_id!r}")
+        return handle, server_id
+
+    def _build_pd_decode_kv_params(
+        self,
+        prefill_out: TokenOutput,
+        connector: str,
+        transfer_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Build decode KV parameters for NIXL, GPU Mooncake, or Ascend Mooncake."""
+        prefill_kv_params = prefill_out.extra_fields.get("kv_transfer_params")
+        # 【按后端整理交接参数】GPU Mooncake 保留原有的 engine_id + bootstrap + transfer_id 方式。
+        # 下面的空块检查只接在 Ascend V1 分支；不能把不同Connector的元数据协议混成一种。
+        # 这里的127.0.0.1建立在当前“一组PD同节点”的限制上，不能原样推广到跨节点PD。
+        if connector == "MooncakeConnector":
+            return {
+                "do_remote_decode": False,
+                "do_remote_prefill": True,
+                "remote_engine_id": self._pd_prefill_engine_id,
+                "remote_bootstrap_addr": (f"http://127.0.0.1:{self._pd_prefill_side_channel_port}"),
+                "transfer_id": transfer_id,
+            }
+        # 当前 Ascend 调用上面的辅助函数：保留真实返回字段，检查有无远端块，必要时让D本地处理prompt。
+        if connector == "MooncakeConnectorV1":
+            return _build_mooncake_decode_kv_params(
+                prefill_kv_params,
+                remote_engine_id=self._pd_prefill_engine_id,
+                remote_bootstrap_addr=(f"http://127.0.0.1:{self._pd_prefill_side_channel_port}"),
+                transfer_id=transfer_id,
+            )
+        # 当前剩余路径为NIXL，直接使用P返回的协议字段；未返回时显式报错，不虚构交接成功。
+        if prefill_kv_params is None:
+            raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
+        return dict(prefill_kv_params)
+
+    async def _release_pd_decode_peer(
+        self, server_id: Optional[str], request_id: str, reservation_id: Optional[str] = None
+    ) -> None:
+        # 【释放的是路由账本】不是关闭D，也不是释放显存或直接销毁KV。
+        # 无路由器/无server_id时跳过；有插件时带回原reservation，让它准确扣掉本次请求的权重或计数。
+        if self._pd_router is None or server_id is None:
+            return
+        try:
+            # 当前会等待release回复；收到异常只记录警告，但不回复的调用仍可能拖住后面的结果返回。
+            # 这里没有实现有界等待、后台监督或租约，讲解时不要承诺所有故障下都能精确回收。
+            await self._pd_router.release_server.remote(
+                server_id=server_id,
+                **{
+                    name: value
+                    for name, value in {"request_id": request_id, "reservation_id": reservation_id}.items()
+                    if name in self._pd_router_release_fields
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - release errors are non-fatal
+            logger.warning("PD decode router release failed: %s", exc)
 
     def _dp_rank_for_session(self, session_id: Optional[str]) -> Optional[int]:
         """Pin a session to one DP engine for prefix-cache reuse; hash-based, so it ignores engine load."""
@@ -869,62 +1093,130 @@ class vLLMHttpServer:
         priority: int = 0,
         session_id: Optional[str] = None,
     ) -> TokenOutput:
-        """Run prefill locally, then decode on a selected peer."""
-        decode_peer = self._select_decode_peer()
-        connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
-        is_mooncake = connector == "MooncakeConnector"
-
-        # Prefill only materializes KV; discard its single generated token.
-        prefill_sp = dict(sampling_params)
-        prefill_sp.pop("max_tokens", None)
-        prefill_sp.pop("max_new_tokens", None)
-        prefill_sp["max_tokens"] = 1
-        transfer_id = uuid.uuid4().hex
-        prefill_kv_params = {
-            "do_remote_decode": True,
-            "do_remote_prefill": False,
-            "transfer_id": transfer_id,
-        }
-
-        prefill_out = await self.generate(
-            prompt_ids,
-            prefill_sp,
-            f"{request_id}_P",
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            mm_processor_kwargs=mm_processor_kwargs,
-            priority=priority,
-            kv_transfer_params=prefill_kv_params,
-            session_id=session_id,
+        """Reserve a decode peer, run prefill locally, then dispatch decode."""
+        # 【整次PD请求的主流程】先选D并记账→本地P阶段→构造交接参数→D阶段→finally释放记账。
+        # 选D发生在P计算之前，因此这个reservation覆盖等待P和运行D的整段时间，不等同于D正运行数。
+        # 有session_id就用它作亲和键，没有时退回本次request_id。
+        effective_routing_key = session_id or request_id
+        # Session affinity and per-call accounting are separate. A retry or
+        # concurrent turn in the same session must not release another call.
+        # 【四种ID分工】session/routing_key管会话亲和；request_id管这次引擎请求；
+        # reservation_id管路由记账；稍后的transfer_id管这次KV交接。它们不是KV块编号。
+        # 同会话两次调用仍要有不同reservation：R1记录1000token、R2记录3000token，先结束R2也只扣3000。
+        # 只用同一个session键记账，后一次调用就可能覆盖前一次，导致释放错账。
+        reservation_id = uuid.uuid4().hex
+        # create_task 单独保存选D操作的本地任务；即使外层在等待时取消，仍可追踪迟到的选择结果。
+        # 这不表示马上并行运行P：下面先await取得D，之后才调用P计算。
+        acquire_task = asyncio.create_task(
+            self._select_decode_peer_for_dispatch(
+                effective_routing_key,
+                prompt_ids,
+                reservation_id=reservation_id,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                priority=priority,
+                session_id=session_id,
+            )
         )
-        if is_mooncake:
-            # Mooncake does not return decode params from the prefill leg.
-            decode_kv_params = {
-                "do_remote_decode": False,
-                "do_remote_prefill": True,
-                "remote_engine_id": self._pd_prefill_engine_id,
-                # Single-node PD uses Mooncake's local bootstrap address.
-                "remote_bootstrap_addr": f"http://127.0.0.1:{self._pd_prefill_side_channel_port}",
+        try:
+            # shield 保护本地acquire_task不随外层等待者一起取消；不等于远端RPC一定成功或一定及时返回。
+            # 这里的await会让出事件循环，actor可处理其他请求；不是同步忙等占满CPU。
+            decode_peer, decode_peer_id = await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            # Cancelling an ObjectRef waiter does not cancel the remote acquire.
+            # Keep its result so an already-recorded reservation can be released.
+            # 【取消恰好发生在选D期间】router可能已经增加负载、但P还没收到D标识。
+            # 所以继续取回结果并release，随后重新抛出取消异常；不会再为已取消请求开始P/D生成。
+            # 重复取消时也保护这段清理。现状：没有超时，router永不返回时取消清理也可能一直等。
+            async def release_after_acquire():
+                _, server_id = await acquire_task
+                await self._release_pd_decode_peer(server_id, effective_routing_key, reservation_id=reservation_id)
+
+            cleanup_task = asyncio.create_task(release_after_acquire())
+            # Repeated caller cancellation must not interrupt this cleanup.
+            while True:
+                try:
+                    await asyncio.shield(cleanup_task)
+                    break
+                except asyncio.CancelledError:
+                    if cleanup_task.cancelled():
+                        break
+                except Exception as exc:  # noqa: BLE001 - preserve the caller's cancellation
+                    logger.warning("PD decode router cancellation cleanup failed: %s", exc)
+                    break
+            raise
+        try:
+            connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
+
+            # Prefill only materializes KV; discard its single generated token.
+            # 【P阶段使用独立采样副本】用户原参数可能max_tokens=512；P只需要完成prompt KV并走一个生成步。
+            # dict复制后只改P副本，D仍收到原始sampling_params，不会被改成只生成1个token。
+            prefill_sp = dict(sampling_params)
+            prefill_sp.pop("max_tokens", None)
+            prefill_sp.pop("max_new_tokens", None)
+            prefill_sp["max_tokens"] = 1
+            # EOS是结束标记。只让这次一次性的P阶段忽略EOS结束条件，按max_tokens=1走完后交出KV元数据。
+            # 它不会让P无限生成；P产出的单个token也不拼进最终答案，后续D按自己的原始设置生成。
+            prefill_sp["ignore_eos"] = True
+            transfer_id = uuid.uuid4().hex
+            # 站在P的角度：remote_decode=True 表示后续decode交给另一端，需要准备可交接KV；
+            # remote_prefill=False 表示不从别处接prompt KV，本P自行处理prompt。
+            # 到D侧标志通常反过来：接远端prefill KV，在自己这里完成decode。
+            prefill_kv_params = {
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
                 "transfer_id": transfer_id,
             }
-        else:
-            decode_kv_params = prefill_out.extra_fields.get("kv_transfer_params")
-            if decode_kv_params is None:
-                raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
 
-        return await decode_peer.generate.remote(
-            prompt_ids,
-            dict(sampling_params),
-            f"{request_id}_D",
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            mm_processor_kwargs=mm_processor_kwargs,
-            priority=priority,
-            kv_transfer_params=decode_kv_params,
-            session_id=session_id,
-        )
+            # 传入KV阶段参数，因此这次self.generate进入实际P引擎执行路径，而不是再次进入完整PD调度。
+            # 请求ID加_P便于区分引擎内部请求；它与后面_D不同，但属于同一条业务请求和KV交接。
+            prefill_out = await self.generate(
+                prompt_ids,
+                prefill_sp,
+                f"{request_id}_P",
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                priority=priority,
+                kv_transfer_params=prefill_kv_params,
+                session_id=session_id,
+            )
+            # An aborted prefill has no completed handoff; let the caller retry
+            # after resume instead of sending incomplete KV metadata to D.
+            # P被中止时直接把中止结果交回调用方，不把未完成的交接信息发给D。
+            # return仍然会经过下方finally，把已选D的reservation释放掉。
+            if getattr(prefill_out, "stop_reason", None) in ("aborted", "abort"):
+                return prefill_out
+            decode_kv_params = self._build_pd_decode_kv_params(
+                prefill_out,
+                connector,
+                transfer_id,
+                request_id,
+            )
+
+            # 【请求第3跳】通过D的Ray句柄生成完整答案，KV参数交给D引擎/Connector解释。
+            # 传输不是在这个Python函数里手写copy完成的；此处传的是元数据与生成参数。
+            # 现状：取消对D ObjectRef的等待不自动证明D已停止，finally可能早于远端D完成而释放记账。
+            return await decode_peer.generate.remote(
+                prompt_ids,
+                dict(sampling_params),
+                f"{request_id}_D",
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                priority=priority,
+                kv_transfer_params=decode_kv_params,
+                session_id=session_id,
+            )
+        finally:
+            # finally覆盖正常返回、P中止和此try内抛错等出口；带回同一个reservation避免扣掉同会话另一请求。
+            # 这是清理尝试，不是跨actor的exactly-once保证；actor崩溃、取消和RPC挂起仍有边界。
+            await self._release_pd_decode_peer(decode_peer_id, effective_routing_key, reservation_id=reservation_id)
 
     @RLInsightLogger.trace_state_decorator(
         "wake_up", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
@@ -933,18 +1225,29 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
 
+        # 【单引擎wake，不是整组编排】这个布尔量只记“本次操作完成后，旧缓存估计需通知路由器失效”。
+        # 它每次调用重新创建，不检查真实显存，也不自己清KV；实际操作在下面的engine调用里。
+        # 普通STANDALONE分支跳过wake，标志保持False；操作抛错也不会走到成功后的通知。
+        cache_invalidated = False
         if self.rollout_mode == RolloutMode.HYBRID:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
             await self._reset_prefix_cache()
+            cache_invalidated = True
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())
             await self._reset_prefix_cache()
+            cache_invalidated = True
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
+        # 实际KV缓存和路由器的“某段前缀在某D上”的估计是两份状态；前者重置后要通知后者。
+        # UniAgent cache_aware.reset清前缀树；session_sticky按哈希定归属，当前reset不改变哈希映射。
+        # reset不应顺手清掉仍需释放的reservation/负载账本。当前此RPC抛错仍会使整个wake调用报错。
+        if cache_invalidated and self._pd_router is not None:
+            await self._pd_router.clear_sticky_cache.remote()
 
     @RLInsightLogger.trace_state_decorator(
         "sleep", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
@@ -953,17 +1256,30 @@ class vLLMHttpServer:
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
+        # 【单引擎sleep】由上层vLLMPDReplica决定先D后P等顺序，本函数只处理当前一个引擎。
+        # HYBRID/COLOCATED实际sleep成功后标True，统一通知一次；STANDALONE这里跳过，不发通知。
+        # node_rank!=0 或 free_cache_engine=False 的入口会更早返回，也不会错误宣称已完成缓存失效。
+        cache_invalidated = False
         if self.rollout_mode == RolloutMode.HYBRID:
             await self._sleep_hybrid()
+            cache_invalidated = True
         elif self.rollout_mode == RolloutMode.COLOCATED:
             await self._engine_sleep(level=1)
+            cache_invalidated = True
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
+        # 有路由器才需要清路由估计；没有插件的轮询无需执行这次RPC。
+        # 当前RPC异常不会被此处吞掉，所以引擎已sleep成功后，router故障仍可能让调用方收到失败。
+        if cache_invalidated and self._pd_router is not None:
+            await self._pd_router.clear_sticky_cache.remote()
 
     async def _engine_sleep(self, level: int):
         # Sleep discards the KV cache and, by default, resets the KV connector, which for a shared store
         # (e.g. MooncakeStoreConnector) deletes entries other replicas still use. Under "salt" that is never
         # needed: unchanged weights keep the current salt, and new weights get a new one.
+        # 【继承上游的外部缓存策略】reset会重置Connector缓存；salt希望通过权重版本隔离外部缓存。
+        # 这是通用引擎辅助方法，不是这次新增Mooncake共享KV池；当前RolloutConfig已拒绝PD配salt。
+        # 因此解释本PD路径时不要把下面的共享存储兼容分支说成已支持的PD模式。
         if self.config.external_kv_cache_invalidation == "salt":
             if "reset_connector" in inspect.signature(self.engine.sleep).parameters:
                 await self.engine.sleep(level=level, reset_connector=False)
@@ -980,17 +1296,23 @@ class vLLMHttpServer:
         # weights; with no connector it is a no-op success. Under "salt" those entries
         # are unreachable through their old salt, so the store, which other replicas may
         # still be reading and writing, is left intact.
+        # 同时按上游策略决定是否重置Connector自己的外部缓存；不要只替换成裸reset_prefix_cache()而丢掉策略。
+        # 这与清路由器的估计不同：本方法作用于引擎/Connector，router另有clear_sticky_cache通知。
         await self.engine.reset_prefix_cache(reset_connector=self.config.external_kv_cache_invalidation == "reset")
 
     @RLInsightLogger.trace_state_decorator(
         "clear_kv_cache", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
     )
     async def clear_kv_cache(self):
+        # 【权重更新后的清理入口】依次重置prefix、多模态处理、encoder缓存，再通知可选PD路由器。
+        # 更新后的权重不能继续信任旧权重计算出的KV；不在这里释放路由reservation。
         if self.node_rank == 0:
             await self._reset_prefix_cache()
 
             await self.engine.reset_mm_cache()
             await self.engine.reset_encoder_cache()
+            if self._pd_router is not None:
+                await self._pd_router.clear_sticky_cache.remote()
 
     @RLInsightLogger.trace_state_decorator(
         "release_kv_cache", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
@@ -1002,6 +1324,8 @@ class vLLMHttpServer:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
+        # 这是继承的独立KV释放路径：借助sleep再只唤醒weights来暂时释放KV池。
+        # 它不是组级有序sleep，也没有在这里新增一套P/D传输屏障或router失效通知。
         await self._engine_sleep(level=self._resolve_sleep_level())
         await self.engine.wake_up(tags=["weights"])
 
