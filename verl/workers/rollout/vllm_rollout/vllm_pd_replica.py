@@ -151,11 +151,10 @@ class vLLMPDReplica(vLLMReplica):
         # 【启动步骤3：预留端口】以下调用仍是 Manager 所在进程的普通 Python 调用。
         # 传入 worker IP 不会把代码迁移到 worker 节点；Manager 异机时可能 bind 非本机IP失败。
         # 这是当前实现边界，注释版没有把预留逻辑改成 worker-side RPC。
-        # 五个返回值依次是：P基础端口列表、bootstrap基础端口、D基础端口列表、占位socket列表、提前关闭标记。
+        # 四个返回值依次是：P基础端口列表、D基础端口列表、占位socket列表、提前关闭标记。
         prefill_host_ip = worker_infos[0][2]
         (
             prefill_side_channel_ports,
-            bootstrap_port,
             decode_side_channel_ports,
             reserved_socks,
             close_sockets_before_launch,
@@ -202,8 +201,8 @@ class vLLMPDReplica(vLLMReplica):
                     kv_transfer_config=prefill_kv_cfg,
                     side_channel_host=prefill_host_ip,
                     side_channel_port=prefill_side_channel_port,
-                    # Native GPU Mooncake starts one bootstrap server per P.
-                    mooncake_bootstrap_port=(bootstrap_port if use_ascend_mooncake_v1 else prefill_side_channel_port),
+                    # GPU Mooncake keeps one bootstrap per P; Ascend V1 uses kv_port instead.
+                    mooncake_bootstrap_port=(None if use_ascend_mooncake_v1 else prefill_side_channel_port),
                     actor_name=actor_name,
                     zmq_base_trainer_rank=start,
                 )
@@ -241,7 +240,7 @@ class vLLMPDReplica(vLLMReplica):
                         kv_transfer_config=decode_kv_cfg,
                         side_channel_host=prefill_host_ip,
                         side_channel_port=decode_side_channel_port,
-                        mooncake_bootstrap_port=bootstrap_port,
+                        mooncake_bootstrap_port=(None if use_ascend_mooncake_v1 else prefill_side_channel_ports[0]),
                         actor_name=f"vllm_server_decode_{self.replica_rank}_{i}{self.name_suffix}",
                         zmq_base_trainer_rank=start,
                     )
@@ -369,7 +368,7 @@ class vLLMPDReplica(vLLMReplica):
         self,
         address: str,
         contiguous: bool,
-    ) -> tuple[list[int], int, list[int], list[socket.socket], bool]:
+    ) -> tuple[list[int], list[int], list[socket.socket], bool]:
         """Reserve P/D ports using either upstream or Ascend allocation semantics."""
         # 【端口分配总管】端口号是数字，socket.bind 才是暂时占位；关闭 socket 才释放占位。
         # prefill_ports/decode_ports 只保存每个引擎的基础端口；reserved_socks 保存所有占位对象。
@@ -378,7 +377,7 @@ class vLLMPDReplica(vLLMReplica):
         prefill_ports: list[int] = []
         decode_ports: list[int] = []
         try:
-            # 例：1P2D，P TP8/D TP4：给 P 预留8个连续端口，给每个D预留4个，另给bootstrap预留16个。
+            # 例：1P2D，P TP8/D TP4：只给 P 预留8个连续端口，给每个D预留4个，共16个。
             # 例如基础端口 P=30000，D0=32000，D1=33000；列表记起点，rank端口由base+rank派生。
             # append 加一个基础端口；extend 把一整段的全部 socket 加进总清理列表。
             if contiguous:
@@ -386,15 +385,11 @@ class vLLMPDReplica(vLLMReplica):
                     prefill_port, prefill_socks = self._reserve_port_range(address, self._prefill_tp)
                     prefill_ports.append(prefill_port)
                     reserved_socks.extend(prefill_socks)
-                # bootstrap 是引导通信，不是“另一个 D”；当前实现额外预留与整组 worker 数相同的连续范围。
-                # 上例 world_size=16，总共暂占8+16+4+4=32个端口。
-                bootstrap_port, bootstrap_socks = self._reserve_port_range(address, self.world_size)
-                reserved_socks.extend(bootstrap_socks)
                 for _ in range(self._n_decode):
                     decode_port, decode_socks = self._reserve_port_range(address, self._decode_tp)
                     decode_ports.append(decode_port)
                     reserved_socks.extend(decode_socks)
-                return prefill_ports, bootstrap_port, decode_ports, reserved_socks, True
+                return prefill_ports, decode_ports, reserved_socks, True
 
             for _ in range(self._n_prefill):
                 # GPU 分支每个引擎只找一个端口，不在本层展开成完整的每TP连续区间。
@@ -406,10 +401,10 @@ class vLLMPDReplica(vLLMReplica):
                 decode_port, decode_sock = get_free_port(address, with_alive_sock=True)
                 decode_ports.append(decode_port)
                 reserved_socks.append(decode_sock)
-            # 返回第一个 P 端口作为该分支的 bootstrap 返回值；GPU Mooncake 的每个 P 启动时用各自端口。
+            # GPU Mooncake 的每个 P 启动时用各自的 P 端口作为 bootstrap，不需要另行预留。
             # 末尾 False 表示不走“创建actor之前提前关闭”分支，外层 finally 会清理剩余占位。
-            return prefill_ports, prefill_ports[0], decode_ports, reserved_socks, False
-        # 整组分配中途失败，要释放前面已成功预留的 P/bootstrap/D 端口段。
+            return prefill_ports, decode_ports, reserved_socks, False
+        # 整组分配中途失败，要释放前面已成功预留的 P/D 端口段。
         # 当前失败段自身的清理由 _reserve_port_range 完成，两层清理负责不同范围。
         except Exception:
             # Reservation may fail before launch_servers enters its try/finally.
@@ -520,7 +515,7 @@ class vLLMPDReplica(vLLMReplica):
         kv_transfer_config: dict,
         side_channel_host: str,
         side_channel_port: int,
-        mooncake_bootstrap_port: int,
+        mooncake_bootstrap_port: Optional[int],
         actor_name: str,
         zmq_base_trainer_rank: int = 0,
     ) -> ActorHandle:
@@ -558,7 +553,6 @@ class vLLMPDReplica(vLLMReplica):
             "NCCL_CUMEM_ENABLE": "0",
             "VLLM_NIXL_SIDE_CHANNEL_HOST": side_channel_host,
             "VLLM_NIXL_SIDE_CHANNEL_PORT": str(side_channel_port),
-            "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(mooncake_bootstrap_port),
             # Avoid Mooncake TCP port exhaustion under validation concurrency.
             "MC_TCP_ENABLE_CONNECTION_POOL": os.environ.get("MC_TCP_ENABLE_CONNECTION_POOL", "1"),
             # 权重接收端用“引擎起点 + TP内部编号”还原整组编号，例如 D1:12+1=13。
@@ -566,6 +560,9 @@ class vLLMPDReplica(vLLMReplica):
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
             "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
         }
+        # GPU Mooncake 使用这个环境变量；NPU V1 的握手走 kv_port，不额外注入 bootstrap 参数。
+        if mooncake_bootstrap_port is not None:
+            env_vars["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(mooncake_bootstrap_port)
 
         # NodeAffinitySchedulingStrategy(soft=False) 把这个服务 actor 固定到其 worker 所在节点。
         # 这个定位约束作用于新 actor，不会把前面已经在 Manager 执行的端口预留操作搬过去。
