@@ -124,6 +124,9 @@ class ServerAdapter(BaseRollout):
             # Each role's TP-rank-0 owns the adapter (vs colocated where every
             # rollout_rank=0 owns it). One log line per PD rank at startup so
             # a deadlock report can be traced back to the role mapping.
+            # Each role's TP-rank-0 owns the adapter (vs colocated where every
+            # rollout_rank=0 owns it). One log line per PD rank at startup so
+            # a deadlock report can be traced back to the role mapping.
             # 每个引擎只由其TP-local0发控制RPC，避免四个rank重复唤醒/清缓存/启动同一次权重接收。
             # 其他rank仍有自己的权重payload发送端，不是被排除在权重同步之外。
             self._has_server = self._pd_tp_local_rank == 0
@@ -146,6 +149,9 @@ class ServerAdapter(BaseRollout):
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
 
+        # PD receivers add VERL_ZMQ_BASE_TRAINER_RANK to the engine-local rank.
+        # Ordinary replicas retain node-local IPC ranks. Job/replica identifiers
+        # keep independent engines and jobs out of each other's IPC namespace.
         # PD receivers add VERL_ZMQ_BASE_TRAINER_RANK to the engine-local rank.
         # Ordinary replicas retain node-local IPC ranks. Job/replica identifiers
         # keep independent engines and jobs out of each other's IPC namespace.
@@ -179,13 +185,12 @@ class ServerAdapter(BaseRollout):
         if self.server_handle is None:
             prefix = self._get_server_name_prefix()
             if self._pd_role == "prefill":
-                # 1P保留旧名server_{组号}_0；多P增加prefill_{组号}_{P下标}_0，以区分同组多个P。
-                # 比如replica1的P1对应server_prefill_1_1_0；D1对应server_decode_1_1。
-                actor_name = (
-                    f"{prefix}server_{self.replica_rank}_0"
-                    if self.config.disaggregation.prefill_replicas == 1
-                    else f"{prefix}server_prefill_{self.replica_rank}_{self._pd_server_index}_0"
-                )
+                # 1P 保留 server_{组号}_0；多 P 用 server_prefill_{组号}_{P下标}_0，避免混淆同组不同 P。
+                # 这里改用明确的 if/else，与启动器命名一致；replica1/P1 对应 server_prefill_1_1_0。
+                if self.config.disaggregation.prefill_replicas == 1:
+                    actor_name = f"{prefix}server_{self.replica_rank}_0"
+                else:
+                    actor_name = f"{prefix}server_prefill_{self.replica_rank}_{self._pd_server_index}_0"
             elif self._pd_role == "decode":
                 actor_name = f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}"
             else:
@@ -274,6 +279,7 @@ class ServerAdapter(BaseRollout):
         if future is not None:
             await future
 
+        # reset caches after updating weights
         # reset caches after updating weights
         # 传完后仍只由每引擎的控制rank发清缓存RPC，避免旧权重KV被继续复用；其他rank不重复发控制命令。
         if self._has_server:

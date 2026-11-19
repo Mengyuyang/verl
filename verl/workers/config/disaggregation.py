@@ -66,8 +66,11 @@ class DisaggregationConfig(BaseConfig):
                 f"disaggregation requires >=1 prefill and >=1 decode replica "
                 f"(got prefill_replicas={self.prefill_replicas}, decode_replicas={self.decode_replicas})"
             )
+        # 显式配置 D 的 TP 时至少为1；None 表示沿用 P 的 TP。这一行只检查下限，不单独验证整数类型。
         if self.decode_tensor_model_parallel_size is not None and self.decode_tensor_model_parallel_size < 1:
             raise ValueError("disaggregation.decode_tensor_model_parallel_size must be positive")
+        # 循环依次检查 P、D：getattr(self, f"{role}_...") 按字符串读取对应角色的属性。
+        # 例如 role=prefill 时读取 prefill_gpu_memory_utilization；显存比例只能在 (0,1] 或为 None。
         for role in ("prefill", "decode"):
             utilization = getattr(self, f"{role}_gpu_memory_utilization")
             if utilization is not None and not 0 < utilization <= 1:
@@ -90,6 +93,8 @@ class DisaggregationConfig(BaseConfig):
             conflicting = sorted(
                 key for key, value in overrides.items() if value is not None and key.replace("-", "_") in topology_keys
             )
+            # 上面的推导式遍历角色 kwargs，找出“值非 None 且键名归一化后属于保护集合”的原始键。
+            # sorted 让报错顺序稳定；列表非空就停止启动，防止已分好4卡却又在 kwargs 中要求8卡。
             if conflicting:
                 raise ValueError(f"disaggregation.{role}_engine_kwargs cannot override PD topology: {conflicting}")
         if self.bootstrap_port is not None and not (0 < self.bootstrap_port < 65536):

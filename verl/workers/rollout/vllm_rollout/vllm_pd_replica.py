@@ -261,7 +261,7 @@ class vLLMPDReplica(vLLMReplica):
         await asyncio.gather(
             *[
                 # 【启动步骤6：建立组内关系】每个 P 获得全部 D 句柄及自己 P 的交接地址信息。
-                # set_pd_peer 在 P 侧初始化轮询或可选 UniAgent router；每个 P 各有独立实例和账本。
+                # set_pd_peer 给 P 保存 D 通讯录及自己的交接身份；每个 P 用独立游标轮询，不创建 selector。
                 server.set_pd_peer.remote(
                     decode_peers=self._decode_servers,
                     prefill_side_channel_port=port,
@@ -271,7 +271,7 @@ class vLLMPDReplica(vLLMReplica):
             ]
         )
 
-        # 【启动步骤7：收集端点】servers 用于组级生命周期调用；旧单入口属性仍指向 P0。
+        # 【启动步骤7：收集端点】servers 用于组级生命周期调用；兼容句柄 _server_handle 仍指向 P0。
         # 下面重新读取所有引擎的 HTTP 地址；这些地址与前面的 KV side-channel 端口用途不同。
         self.servers = list(self._prefill_servers) + list(self._decode_servers)
         self._server_handle = self._prefill_servers[0]
@@ -283,8 +283,6 @@ class vLLMPDReplica(vLLMReplica):
         self._decode_server_addresses = [
             self._format_server_address(host, port) for host, port in addresses[len(self._prefill_servers) :]
         ]
-        self._server_address = self._prefill_server_addresses[0]
-
         logger.info(
             "vLLMPDReplica rank=%s launched: prefills=%s, decodes=%s",
             self.replica_rank,
@@ -305,27 +303,30 @@ class vLLMPDReplica(vLLMReplica):
             raise RuntimeError("PD prefill metrics endpoints are not ready")
         if len(self._decode_server_addresses) != len(self._decode_servers):
             raise RuntimeError("PD decode metrics endpoints are not ready")
-        return [
-            *[
+        # 按 P、D 两段普通循环构建监控条目，便于逐行阅读；每条是 (采集地址, 标签字典)。
+        # 单 P 保留旧标签 0-prefill，多 P 用 0-prefill0/1；D 标签为 0-decode0/1。
+        # 这些标签用于区分引擎；监控名单不是允许完整请求直接访问的入口名单。
+        endpoints = []
+        for index, address in enumerate(self._prefill_server_addresses):
+            if len(self._prefill_servers) == 1:
+                replica_label = f"{self.replica_rank}-prefill"
+            else:
+                replica_label = f"{self.replica_rank}-prefill{index}"
+            endpoints.append(
                 (
                     address,
                     {
-                        "replica": (
-                            f"{self.replica_rank}-prefill"
-                            if len(self._prefill_servers) == 1
-                            else f"{self.replica_rank}-prefill{index}"
-                        ),
+                        "replica": replica_label,
                         "pd_role": "prefill",
                         "pd_index": index,
                     },
                 )
-                for index, address in enumerate(self._prefill_server_addresses)
-            ],
-            *[
+            )
+        for index, address in enumerate(self._decode_server_addresses):
+            endpoints.append(
                 (address, {"replica": f"{self.replica_rank}-decode{index}", "pd_role": "decode", "pd_index": index})
-                for index, address in enumerate(self._decode_server_addresses)
-            ],
-        ]
+            )
+        return endpoints
 
     async def resume_generation(self):
         """Resume every independent P/D engine before opening any admission gate."""
@@ -362,6 +363,8 @@ class vLLMPDReplica(vLLMReplica):
 
     @staticmethod
     def _format_server_address(host: str, port: int) -> str:
+        # 统一格式化服务地址：IPv4 为 192.168.1.10:8000，IPv6 为 [2001:db8::1]:8000。
+        # IPv6 自带冒号，用方括号分清 IP 与端口；staticmethod 表示只依赖参数，不读取 self。
         return f"[{host}]:{port}" if is_valid_ipv6_address(host) else f"{host}:{port}"
 
     def _reserve_pd_ports(
@@ -420,6 +423,9 @@ class vLLMPDReplica(vLLMReplica):
         Reserving only the base port lets two independently selected engines
         claim overlapping ranges and makes PD startup intermittent.
         """
+        # 为什么要整段预留：TP4 的基础端口若为30000，后端按 rank 使用30000/30001/30002/30003。
+        # 只找空闲30000，不能保证后面三个空闲；另一引擎选30002作起点就会与当前区间重叠。
+        # 所以逐个 bind 整段，并在分配下一引擎时保持占位；GPU 仍预留单端口，只是不在本层展开区间。
         if count < 1:
             raise ValueError(f"port range count must be positive, got {count}")
         family = socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
@@ -560,6 +566,7 @@ class vLLMPDReplica(vLLMReplica):
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
             "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
         }
+        # GPU Mooncake uses bootstrap; Ascend V1 handshakes use kv_port.
         # GPU Mooncake 使用这个环境变量；NPU V1 的握手走 kv_port，不额外注入 bootstrap 参数。
         if mooncake_bootstrap_port is not None:
             env_vars["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(mooncake_bootstrap_port)

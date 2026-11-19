@@ -151,7 +151,7 @@ class LLMServerClient:
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
             # 一次调用等待完整结果，包括 P 计算和 D 生成；返回结果之后才走 finally 释放外层计数。
-            # request_id 用于本次引擎请求，session_id 保留会话关联，供后续 P/D 路由使用。
+            # request_id 用于本次引擎请求，session_id 保留会话关联；组内 D 仍按每个 P 自己的轮询游标选择。
             output: TokenOutput = await server.generate.remote(
                 request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
                 prompt_ids=prompt_ids,
@@ -461,6 +461,8 @@ class LLMServerManager:
         )
         # PD inflates per-replica footprint; miss this and init_hybrid slices
         # past worker_group → empty workers on replica_rank>=1.
+        # PD inflates per-replica footprint; miss this and init_hybrid slices
+        # past worker_group → empty workers on replica_rank>=1.
         # 【讲解入口 2：Manager 管多少组】普通引擎的设备数和整个 PD 组的设备数不同。
         # 例如每组 2P2D/TP4 占 16 个 worker；总资源 32 个 worker 时可组成两组 replica。
         # 这个数必须与 vLLMPDReplica.world_size、ServerAdapter 的 rank 划分完全一致。
@@ -523,6 +525,7 @@ class LLMServerManager:
         print(f"LLMServerManager: {self.server_addresses}")
 
         # Scrape targets may include engines that are not generation entries (PD decode).
+        # Scrape targets may include engines that are not generation entries (PD decode).
         # 【监控名单】与请求入口分开收集：2P2D 的路由入口只有两个 P，监控目标却有全部四个 P/D。
         # 否则只看 P 指标，会漏掉 D 的队列、KV 使用等运行情况。
         metrics_addresses = []
@@ -532,6 +535,7 @@ class LLMServerManager:
                 metrics_addresses.append(address)
                 metrics_labels.append(endpoint_labels)
 
+        # Update Prometheus / rl-insight metrics with server addresses
         # Update Prometheus / rl-insight metrics with server addresses
         # Prometheus 在这里使用采集地址，RL-Insight 还使用 replica/pd_role/pd_index 标签。
         # 现状：这里检查公共 disable_log_stats；没有额外验证每个角色 kwargs 的最终覆盖值。
@@ -554,7 +558,7 @@ class LLMServerManager:
 
         # zip 把同下标的地址/句柄配对，dict 变成 {地址: ActorHandle} 交给外层路由器。
         # strict=True 要求两份列表等长，避免 zip 默默截断而漏注册服务。
-        # 外层选择 P，P 内部再选择 D；这与可选的 custom.pd_router_config_path 是两层路由。
+        # 外层保留既有 Router 选择 P；本版 P 内部只轮询 D，不读取 custom.pd_router_config_path。
         self.global_load_balancer = get_router_handle(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             router_config_path=getattr(self.rollout_config, "router_config_path", None),
